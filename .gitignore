@@ -1,3 +1,9 @@
+# Pipeline output artifacts
+cx-docs/
+cx-extracted.json
+checkmarx-one-docs.md
+failures.log
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

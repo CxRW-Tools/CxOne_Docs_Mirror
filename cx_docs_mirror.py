@@ -41,6 +41,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -59,18 +60,27 @@ from markdownify import markdownify as md
 START_URL = "https://docs.checkmarx.com/en/34965-68517-checkmarx-one-user-guide.html"
 
 # --- What to keep -----------------------------------------------------------
-# Classification uses each page's breadcrumb root (the first product node).
-# If INCLUDE_PRODUCTS is non-empty, ONLY those products are kept and EXCLUDE is
-# ignored. Otherwise everything is kept EXCEPT the products in EXCLUDE_PRODUCTS.
-INCLUDE_PRODUCTS: list[str] = []           # e.g. ["Checkmarx One", "Checkmarx DAST"]
-EXCLUDE_PRODUCTS: list[str] = [
-    "Checkmarx SCA",
-    "Checkmarx SAST",
-    "SAST/SCA Integrations",
+# INCLUDE_PRODUCTS is the primary crawl-time allowlist. The mirror stage uses
+# the docs navigation tree to seed only these product branches, then verifies
+# each downloaded page's breadcrumb root against this set and prunes anything
+# that slipped through. Leave empty to crawl everything (subject to
+# EXCLUDE_PRODUCTS). The extract stage uses the same list for its own filter.
+INCLUDE_PRODUCTS: list[str] = [
+    "Checkmarx One",
+    "Checkmarx Developer Assist",
+    "Checkmarx DAST",
+    "Checkmarx Codebashing",
+    "Malicious Package Identification API (MPIAPI)",
+    "Checkmarx CheckAI",
+    "Checkmarx Idea Portal",
 ]
-# Pages in an excluded product that are LINKED from a kept page get pulled back
-# in (e.g. supported-languages tables). 0 disables; 1 = one hop; 2 = two hops.
-RESCUE_DEPTH = 1
+# EXCLUDE_PRODUCTS is only consulted when INCLUDE_PRODUCTS is empty.
+EXCLUDE_PRODUCTS: list[str] = []
+
+# Cross-product page rescue in the extract stage. Kept at 0: the mirror stage
+# now prunes excluded branches at crawl time, so rescuing cross-links would
+# reintroduce content we deliberately skipped.
+RESCUE_DEPTH = 0
 
 # A page must have at least this many characters of real content to count as
 # healthy; below this it's flagged 'thin'.
@@ -159,12 +169,25 @@ def url_to_path(url: str, out_dir: Path) -> Path:
 
 
 def parse_page(html: str, base_url: str, root: str,
-               min_chars: int) -> tuple[str, set[str]]:
-    """One BeautifulSoup pass → (status, in_scope_links).
+               min_chars: int) -> tuple[str, str | None, set[str]]:
+    """One BeautifulSoup pass → (status, product_root, in_scope_links).
 
-    status: 'ok' (enough real content) | 'thin' (some, but under min_chars) |
-    'shell' (no content section at all)."""
+    status:       'ok' | 'thin' | 'shell'
+    product_root: first breadcrumb item, or None when there is no breadcrumb."""
     soup = BeautifulSoup(html, "lxml")
+
+    # Breadcrumb root — first non-current-category <li> text.
+    product_root: str | None = None
+    ul = soup.find("ul", class_="breadcrumb")
+    if ul:
+        for li in ul.find_all("li", recursive=False):
+            if li.find("span", class_="current-category"):
+                continue
+            t = li.get_text(strip=True)
+            if t:
+                product_root = t
+                break
+
     tc = soup.find(id="topic-content")
     section = tc.find("section") if tc else None
     if section is None:
@@ -172,12 +195,13 @@ def parse_page(html: str, base_url: str, root: str,
     else:
         n_chars = len(section.get_text(" ", strip=True))
         status = "ok" if n_chars >= min_chars else "thin"
+
     links = set()
     for a in soup.find_all("a", href=True):
         absolute, _ = urldefrag(urljoin(base_url, a["href"]))
         if is_in_scope(absolute, root):
             links.add(absolute)
-    return status, links
+    return status, product_root, links
 
 
 def slugify(text: str) -> str:
@@ -191,6 +215,12 @@ def digest(text: str) -> str:
     Uses sha256 rather than hash() so the same body produces the same key in
     every process, regardless of PYTHONHASHSEED."""
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def _dated_path(path: str) -> str:
+    """Insert today's date into a file stem: foo.md → foo-2026-08-27.md."""
+    p = Path(os.path.normpath(path))
+    return str(p.with_stem(f"{p.stem}-{time.strftime('%Y-%m-%d')}"))
 
 
 def compile_title_filters(patterns: list[str]) -> list[re.Pattern]:
@@ -259,34 +289,37 @@ async def _fetch_with_retries(page, url: str, *, retries: int, timeout: int,
 
 
 async def _read_cached(dest: Path, url: str, root: str,
-                       cfg: SimpleNamespace) -> set[str] | None:
-    """Links from an already-mirrored page worth reusing, or None to refetch."""
+                       cfg: SimpleNamespace) -> tuple[str | None, set[str]] | None:
+    """Return (product_root, links) for a usable cached page, or None to refetch."""
     if not dest.exists() or cfg.force:
         return None
     existing = await asyncio.to_thread(
         dest.read_text, encoding="utf-8", errors="replace")
-    status, links = await asyncio.to_thread(
+    status, product_root, links = await asyncio.to_thread(
         parse_page, existing, url, root, cfg.min_chars)
-    return links if status in USABLE_STATUSES else None
+    return (product_root, links) if status in USABLE_STATUSES else None
 
 
-async def _fetch_and_save(page, url: str, dest: Path, root: str,
-                          cfg: SimpleNamespace) -> tuple[str, set[str]]:
-    """Fetch, verify, and persist one page → (status, links).
+async def _fetch_parse(page, url: str, root: str,
+                       cfg: SimpleNamespace) -> tuple[str, str | None, str | None, set[str]]:
+    """Fetch and parse one page → (status, product_root, html, links).
 
-    Nothing is written unless the page carries real content, so a failed run
-    never poisons the mirror with shells for the next one to reuse."""
+    Does NOT write to disk; the caller decides whether to save based on the
+    breadcrumb product before committing I/O."""
     html = await _fetch_with_retries(
         page, url, retries=cfg.retries, timeout=cfg.timeout)
     if html is None:
-        return "shell", set()
-    status, links = await asyncio.to_thread(
+        return "shell", None, None, set()
+    status, product_root, links = await asyncio.to_thread(
         parse_page, html, url, root, cfg.min_chars)
     if status not in USABLE_STATUSES:
-        return status, set()
+        return status, product_root, None, set()
+    return status, product_root, html, links
+
+
+async def _save_page(html: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(dest.write_text, html, encoding="utf-8")
-    return status, links
 
 
 async def _polite_wait(cfg: SimpleNamespace) -> None:
@@ -294,7 +327,68 @@ async def _polite_wait(cfg: SimpleNamespace) -> None:
         await asyncio.sleep(cfg.wait)
 
 
-async def _worker(ctx, queue, visited, cfg, root, out_dir, stats, failures, stop):
+def _is_excluded(product_root: str | None, allowed: set[str]) -> bool:
+    """True when this page's breadcrumb product is not in the allowlist.
+
+    When the allowlist is empty no filtering is applied (crawl everything)."""
+    if not allowed:
+        return False
+    return (product_root or "").strip().lower() not in allowed
+
+
+async def _discover_seed_urls(page, cfg: SimpleNamespace, start_url: str) -> list[str]:
+    """Load the docs start page, parse the navigation sidebar, and return root
+    URLs for each allowed product.
+
+    Tries several common nav/sidebar CSS selectors. If none match or no seeds
+    are found, falls back to [start_url] and breadcrumb-based filtering alone."""
+    try:
+        await page.goto(start_url, wait_until="domcontentloaded", timeout=cfg.timeout)
+        html = await page.content()
+    except Exception as e:
+        print(f"[mirror] seed discovery failed ({e!s:.80}); "
+              f"falling back to start URL", file=sys.stderr)
+        return [start_url]
+
+    soup = BeautifulSoup(html, "lxml")
+    include_lower = {p.strip().lower() for p in cfg.include}
+
+    # Walk common nav selectors, stop at the first one that exists.
+    nav_root = None
+    for sel in ("nav", ".sidenav", ".navigation", "#navigation",
+                ".toc", "#toc", ".sidebar", "#sidebar"):
+        nav_root = (soup.find(sel[1:], class_=sel[1:]) if sel.startswith(".")
+                    else soup.find(id=sel[1:]) if sel.startswith("#")
+                    else soup.find(sel))
+        if nav_root:
+            break
+    search_scope = nav_root if nav_root else soup
+
+    seeds: list[str] = []
+    seen: set[str] = set()
+    for a in search_scope.find_all("a", href=True):
+        text = a.get_text(strip=True).lower()
+        if not any(inc in text or text in inc for inc in include_lower):
+            continue
+        url, _ = urldefrag(urljoin(start_url, a["href"]))
+        if url in seen or not is_in_scope(url, start_url):
+            continue
+        seen.add(url)
+        seeds.append(url)
+
+    if seeds:
+        print(f"[mirror] {len(seeds)} seed URL(s) from nav tree:")
+        for s in seeds:
+            print(f"         {s}")
+    else:
+        print("[mirror] no nav seeds matched; "
+              "falling back to start URL + breadcrumb filtering", file=sys.stderr)
+        seeds = [start_url]
+
+    return seeds
+
+
+async def _worker(ctx, queue, visited, visited_lock, cfg, root, out_dir, stats, failures, stop, allowed_products):
     page = await ctx.new_page()
     try:
         while True:
@@ -304,19 +398,31 @@ async def _worker(ctx, queue, visited, cfg, root, out_dir, stats, failures, stop
                     continue
 
                 dest = url_to_path(url, out_dir)
-                links = await _read_cached(dest, url, root, cfg)
-                if links is not None:
+                cached = await _read_cached(dest, url, root, cfg)
+                if cached is not None:
+                    product_root, links = cached
+                    if _is_excluded(product_root, allowed_products):
+                        stats["skipped"] += 1
+                        print(f"[skip/product] d{depth}  {url}  ({product_root!r})")
+                        await _polite_wait(cfg)
+                        continue
                     stats["reused"] += 1
                     print(f"[reuse] d{depth}  {url}")
                 else:
-                    status, links = await _fetch_and_save(
-                        page, url, dest, root, cfg)
+                    status, product_root, html, links = await _fetch_parse(
+                        page, url, root, cfg)
                     if status not in USABLE_STATUSES:
                         stats["failed"] += 1
                         failures.append(url)
                         print(f"  ! FAILED ({status}): {url}", file=sys.stderr)
                         await _polite_wait(cfg)
                         continue
+                    if _is_excluded(product_root, allowed_products):
+                        stats["skipped"] += 1
+                        print(f"[skip/product] d{depth}  {url}  ({product_root!r})")
+                        await _polite_wait(cfg)
+                        continue
+                    await _save_page(html, dest)
                     stats["saved"] += 1
                     if status == "thin":
                         stats["thin"] += 1
@@ -327,10 +433,11 @@ async def _worker(ctx, queue, visited, cfg, root, out_dir, stats, failures, stop
                     continue
 
                 if depth < cfg.depth:
-                    for link in links:
-                        if link not in visited:
-                            visited.add(link)
-                            queue.put_nowait((link, depth + 1))
+                    async with visited_lock:
+                        new_links = [l for l in links if l not in visited]
+                        visited.update(new_links)
+                    for link in new_links:
+                        queue.put_nowait((link, depth + 1))
 
                 await _polite_wait(cfg)
             finally:
@@ -349,10 +456,12 @@ async def _mirror(cfg: SimpleNamespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     fail_log = out_dir.parent / "failures.log"
 
-    visited = {root}
+    allowed_products = {p.strip().lower() for p in cfg.include}
+
+    visited: set[str] = set()
+    visited_lock = asyncio.Lock()
     queue: asyncio.Queue = asyncio.Queue()
-    queue.put_nowait((root, 0))
-    stats = {"saved": 0, "reused": 0, "failed": 0, "thin": 0}
+    stats = {"saved": 0, "reused": 0, "skipped": 0, "failed": 0, "thin": 0}
     failures: list[str] = []
     stop = asyncio.Event()
 
@@ -362,8 +471,21 @@ async def _mirror(cfg: SimpleNamespace) -> None:
         ctx = await browser.new_context(user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"))
+
+        # Discover seed URLs from the nav tree for the allowed product branches.
+        # Each seed is a root URL for one allowed product; crawl workers prune
+        # any pages that slip through with a mismatched breadcrumb.
+        seed_page = await ctx.new_page()
+        seeds = await _discover_seed_urls(seed_page, cfg, root)
+        await seed_page.close()
+        for seed in seeds:
+            if seed not in visited:
+                visited.add(seed)
+                queue.put_nowait((seed, 0))
+
         workers = [asyncio.create_task(
-            _worker(ctx, queue, visited, cfg, root, out_dir, stats, failures, stop))
+            _worker(ctx, queue, visited, visited_lock, cfg, root, out_dir,
+                    stats, failures, stop, allowed_products))
             for _ in range(cfg.concurrency)]
         await queue.join()
         for w in workers:
@@ -376,7 +498,8 @@ async def _mirror(cfg: SimpleNamespace) -> None:
     dt = time.time() - start
     print(f"\n[mirror] done in {dt/60:.1f} min — "
           f"saved {stats['saved']} (thin {stats['thin']}), "
-          f"reused {stats['reused']}, failed {stats['failed']}")
+          f"reused {stats['reused']}, skipped {stats['skipped']}, "
+          f"failed {stats['failed']}")
     if failures:
         print(f"[mirror] {len(failures)} failures logged to {fail_log}; "
               f"re-run --stage mirror to retry just those.")
@@ -515,7 +638,7 @@ def stage_extract(cfg: SimpleNamespace) -> None:
 
     index = _index_pages(files)
     _classify(index, cfg.include, cfg.exclude)
-    _rescue_linked(index, cfg.rescue_depth)
+    _rescue_linked(index, 0)          # rescue disabled: mirror prunes at crawl time
     title_dropped = _drop_by_title(index, cfg.title_exclude)
     records, dupes = _build_records(index)
 
@@ -587,11 +710,13 @@ def stage_combine(cfg: SimpleNamespace) -> None:
 
     ordered = order_products(by_product, cfg.product_order)
 
-    lines = []
-    lines.append(f"# {cfg.doc_title}\n")
-    lines.append(f"_Generated {time.strftime('%Y-%m-%d')} from {cfg.url}_\n")
+    date = time.strftime("%Y-%m-%d")
     excluded = ", ".join(cfg.exclude) if not cfg.include else \
         f"(include-only: {', '.join(cfg.include)})"
+    lines = []
+    lines.append(f"# {cfg.doc_title}\n")
+    lines.append(f"**Captured:** {date}\n")
+    lines.append(f"_Source: {cfg.url}_\n")
     lines.append(f"_Pages: {len(kept)} kept across {len(ordered)} products; "
                  f"{len(rescued)} referenced. Excluded: {excluded}._\n")
 
@@ -714,7 +839,8 @@ def stage_compress(cfg: SimpleNamespace) -> None:
 
     # Re-render.
     out = [f"# {h1}\n",
-           f"_Generated {time.strftime('%Y-%m-%d')} from {cfg.url} (compressed)_\n",
+           f"**Captured:** {time.strftime('%Y-%m-%d')}\n",
+           f"_Source: {cfg.url} (compressed)_\n",
            f"_Pages: {total_pages} across {len(ordered)} products; "
            f"{len(kept_ref)} referenced. "
            f"Removed {dropped_title} version/changelog pages and "
@@ -765,7 +891,6 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
         url=pick(args.url, START_URL),
         include=pick(args.include, INCLUDE_PRODUCTS),
         exclude=pick(args.exclude, EXCLUDE_PRODUCTS),
-        rescue_depth=pick(args.rescue_depth, RESCUE_DEPTH),
         min_chars=pick(args.min_chars, MIN_CHARS),
         concurrency=pick(args.concurrency, CONCURRENCY),
         depth=pick(args.depth, MAX_DEPTH),
@@ -776,7 +901,7 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
         force=args.force,
         html_dir=pick(args.html_dir, HTML_DIR),
         json_path=pick(args.json_path, EXTRACT_JSON),
-        md_path=pick(args.md_path, CANONICAL_MD),
+        md_path=_dated_path(pick(args.md_path, CANONICAL_MD)),
         md_out=args.md_out,
         title_exclude=pick(args.title_exclude, TITLE_EXCLUDE_PATTERNS),
         doc_title=pick(args.doc_title, DOC_TITLE),
