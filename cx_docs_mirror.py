@@ -353,13 +353,27 @@ async def _discover_seed_urls(page, cfg: SimpleNamespace, start_url: str) -> lis
     soup = BeautifulSoup(html, "lxml")
     include_lower = {p.strip().lower() for p in cfg.include}
 
-    # Walk common nav selectors, stop at the first one that exists.
+    # Walk candidate nav selectors, stop at the first that exists.
+    # aside/ul.toc precede 'nav' intentionally: on MadCap Flare sites the
+    # <nav> tag is the top header bar, not the sidebar product tree.
     nav_root = None
-    for sel in ("nav", ".sidenav", ".navigation", "#navigation",
-                ".toc", "#toc", ".sidebar", "#sidebar"):
-        nav_root = (soup.find(sel[1:], class_=sel[1:]) if sel.startswith(".")
-                    else soup.find(id=sel[1:]) if sel.startswith("#")
-                    else soup.find(sel))
+    for sel_type, sel_val in [
+        ("tag",   "aside"),
+        ("class", "nav-site-sidebar"),
+        ("class", "toc"),
+        ("class", "sidenav"),
+        ("class", "navigation"),
+        ("id",    "navigation"),
+        ("class", "sidebar"),
+        ("id",    "sidebar"),
+        ("tag",   "nav"),
+    ]:
+        if sel_type == "tag":
+            nav_root = soup.find(sel_val)
+        elif sel_type == "class":
+            nav_root = soup.find(class_=sel_val)
+        else:
+            nav_root = soup.find(id=sel_val)
         if nav_root:
             break
     search_scope = nav_root if nav_root else soup
