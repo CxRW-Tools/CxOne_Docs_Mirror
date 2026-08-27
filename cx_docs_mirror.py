@@ -24,8 +24,14 @@ overridden on the command line — see `--help`.
 
 ------------------------------------------------------------------------------
 SETUP (Python 3.9+):
-    pip install -r requirements.txt
-    playwright install chromium          # only needed for the mirror stage
+    python -m pip install -r requirements.txt
+    python -m playwright install chromium   # only needed for the mirror stage
+
+Invoke both through `python -m` (`py -m` on Windows). Plain `playwright
+install` needs the interpreter's Scripts/bin directory on PATH, which it often
+is not; the module form always resolves to the interpreter you just installed
+into. Only chromium is used — a bare `playwright install` also fetches Firefox
+and WebKit.
 ------------------------------------------------------------------------------
 """
 
