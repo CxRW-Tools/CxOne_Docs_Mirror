@@ -1,0 +1,12 @@
+# Dependencies for cx_docs_mirror.py (Python 3.9+).
+#
+#   pip install -r requirements.txt
+#   playwright install chromium     # browser binary — mirror stage only
+#
+# playwright is imported lazily inside the mirror stage, so the extract,
+# combine and compress stages run with just the three parsing libraries.
+
+beautifulsoup4>=4.12,<5     # HTML parsing / breadcrumb + content extraction
+lxml>=5.0,<7                # parser backend used by BeautifulSoup("lxml")
+markdownify>=0.13,<2        # HTML -> Markdown conversion
+playwright>=1.40,<2         # headless Chromium crawl (mirror stage)

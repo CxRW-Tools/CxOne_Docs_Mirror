@@ -1,39 +1,46 @@
 #!/usr/bin/env python3
 """
-cx_docs_mirror.py — End-to-end Checkmarx docs pipeline in three stages:
+cx_docs_mirror.py — End-to-end Checkmarx docs pipeline in four stages:
 
-    1. MIRROR   Crawl the docs site (concurrent, verifying, retrying) to HTML.
-    2. EXTRACT  Filter by product, rescue cross-linked exceptions, convert the
-                real content of each kept page to faithful Markdown.
-    3. COMBINE  Merge everything into ONE canonical .md with a clean heading
-                hierarchy (doc > product > page > page-content).
+    1. MIRROR    Crawl the docs site (concurrent, verifying, retrying) to HTML.
+    2. EXTRACT   Filter by product, rescue cross-linked exceptions, convert the
+                 real content of each kept page to faithful Markdown.
+    3. COMBINE   Merge everything into ONE canonical .md with a clean heading
+                 hierarchy (doc > product > page > page-content).
+    4. COMPRESS  Post-process an existing canonical .md, dropping version /
+                 changelog pages and duplicates. Not part of the default run.
 
-Run all stages (default) or any one in isolation:
+Run the first three stages (default) or any one in isolation:
 
     python cx_docs_mirror.py                 # mirror -> extract -> combine
     python cx_docs_mirror.py --stage mirror
     python cx_docs_mirror.py --stage extract
     python cx_docs_mirror.py --stage combine
+    python cx_docs_mirror.py --stage compress
 
 All knobs live in the CONFIG block below (target URL, what to include/exclude,
 crawl tuning, output paths, product ordering). Anything there can also be
 overridden on the command line — see `--help`.
 
 ------------------------------------------------------------------------------
-SETUP:
-    pip install playwright beautifulsoup4 lxml markdownify
+SETUP (Python 3.9+):
+    pip install -r requirements.txt
     playwright install chromium          # only needed for the mirror stage
 ------------------------------------------------------------------------------
 """
 
+from __future__ import annotations
+
 import argparse
+import asyncio
+import hashlib
 import json
 import re
 import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.parse import urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
@@ -112,6 +119,10 @@ SKIP_EXTENSIONS = {
     ".js", ".css", ".json", ".xml", ".pdf", ".zip", ".gz",
 }
 
+# A mirrored page is worth keeping in these two states; anything else is a
+# navigation shell or an error page.
+USABLE_STATUSES = ("ok", "thin")
+
 
 # ===========================================================================
 # Shared helpers
@@ -141,23 +152,26 @@ def url_to_path(url: str, out_dir: Path) -> Path:
     return out_dir / path.lstrip("/")
 
 
-def parse_page(html: str, base_url: str, root: str, min_chars: int):
-    """One BeautifulSoup pass → (status, char_count, in_scope_links, soup).
-    status: 'ok' | 'thin' | 'shell'."""
+def parse_page(html: str, base_url: str, root: str,
+               min_chars: int) -> tuple[str, set[str]]:
+    """One BeautifulSoup pass → (status, in_scope_links).
+
+    status: 'ok' (enough real content) | 'thin' (some, but under min_chars) |
+    'shell' (no content section at all)."""
     soup = BeautifulSoup(html, "lxml")
     tc = soup.find(id="topic-content")
     section = tc.find("section") if tc else None
     if section is None:
-        status, n = "shell", 0
+        status = "shell"
     else:
-        n = len(section.get_text(" ", strip=True))
-        status = "ok" if n >= min_chars else "thin"
+        n_chars = len(section.get_text(" ", strip=True))
+        status = "ok" if n_chars >= min_chars else "thin"
     links = set()
     for a in soup.find_all("a", href=True):
         absolute, _ = urldefrag(urljoin(base_url, a["href"]))
         if is_in_scope(absolute, root):
             links.add(absolute)
-    return status, n, links, soup
+    return status, links
 
 
 def slugify(text: str) -> str:
@@ -165,17 +179,57 @@ def slugify(text: str) -> str:
     return re.sub(r"[\s_-]+", "-", s) or "section"
 
 
+def digest(text: str) -> str:
+    """Stable content fingerprint for dedup.
+
+    Uses sha256 rather than hash() so the same body produces the same key in
+    every process, regardless of PYTHONHASHSEED."""
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def compile_title_filters(patterns: list[str]) -> list[re.Pattern]:
+    return [re.compile(p, re.I) for p in patterns]
+
+
+def title_excluded(title: str, filters: list[re.Pattern]) -> bool:
+    return any(rx.search(title) for rx in filters)
+
+
+def order_products(products, product_order: list[str]) -> list[str]:
+    """Configured order first, then anything unlisted, alphabetically."""
+    listed = [p for p in product_order if p in products]
+    return listed + sorted(p for p in products if p not in product_order)
+
+
+def contents_lines(ordered: list[str], counts: dict[str, int],
+                   n_referenced: int) -> list[str]:
+    """Top-level table of contents (products only — page lists live in each
+    section). Shared by the combine and compress renderers."""
+    lines = ["## Contents\n"]
+    for p in ordered:
+        lines.append(f"- [{p}](#{slugify(p)}) ({counts[p]} pages)")
+    if n_referenced:
+        lines.append(f"- [Referenced Material](#referenced-material) "
+                     f"({n_referenced} pages)")
+    lines.append("")
+    return lines
+
+
 # ===========================================================================
 # STAGE 1 — MIRROR (concurrent, verifying, retrying)
 # ===========================================================================
 
-def stage_mirror(cfg):
-    import asyncio
+def stage_mirror(cfg: SimpleNamespace) -> None:
     asyncio.run(_mirror(cfg))
 
 
-async def _fetch_with_retries(page, url, *, retries, timeout, settle_ms=6000):
-    import asyncio
+async def _fetch_with_retries(page, url: str, *, retries: int, timeout: int,
+                              settle_ms: int = 6000) -> str | None:
+    """Load `url`, escalating the timeout on each attempt.
+
+    Early attempts insist on the real content selector; the final attempt
+    settles for domcontentloaded plus a fixed wait, which is enough for pages
+    that render slowly but are otherwise fine."""
     last_html = None
     for attempt in range(retries):
         is_final = attempt == retries - 1
@@ -198,8 +252,43 @@ async def _fetch_with_retries(page, url, *, retries, timeout, settle_ms=6000):
     return last_html
 
 
+async def _read_cached(dest: Path, url: str, root: str,
+                       cfg: SimpleNamespace) -> set[str] | None:
+    """Links from an already-mirrored page worth reusing, or None to refetch."""
+    if not dest.exists() or cfg.force:
+        return None
+    existing = await asyncio.to_thread(
+        dest.read_text, encoding="utf-8", errors="replace")
+    status, links = await asyncio.to_thread(
+        parse_page, existing, url, root, cfg.min_chars)
+    return links if status in USABLE_STATUSES else None
+
+
+async def _fetch_and_save(page, url: str, dest: Path, root: str,
+                          cfg: SimpleNamespace) -> tuple[str, set[str]]:
+    """Fetch, verify, and persist one page → (status, links).
+
+    Nothing is written unless the page carries real content, so a failed run
+    never poisons the mirror with shells for the next one to reuse."""
+    html = await _fetch_with_retries(
+        page, url, retries=cfg.retries, timeout=cfg.timeout)
+    if html is None:
+        return "shell", set()
+    status, links = await asyncio.to_thread(
+        parse_page, html, url, root, cfg.min_chars)
+    if status not in USABLE_STATUSES:
+        return status, set()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(dest.write_text, html, encoding="utf-8")
+    return status, links
+
+
+async def _polite_wait(cfg: SimpleNamespace) -> None:
+    if cfg.wait:
+        await asyncio.sleep(cfg.wait)
+
+
 async def _worker(ctx, queue, visited, cfg, root, out_dir, stats, failures, stop):
-    import asyncio
     page = await ctx.new_page()
     try:
         while True:
@@ -207,40 +296,25 @@ async def _worker(ctx, queue, visited, cfg, root, out_dir, stats, failures, stop
             try:
                 if stop.is_set():
                     continue
+
                 dest = url_to_path(url, out_dir)
-                html, links = None, set()
-
-                if dest.exists() and not cfg.force:
-                    existing = await asyncio.to_thread(
-                        dest.read_text, encoding="utf-8", errors="replace")
-                    status, _, links, _ = await asyncio.to_thread(
-                        parse_page, existing, url, root, cfg.min_chars)
-                    if status in ("ok", "thin"):
-                        html = existing
-                        stats["reused"] += 1
-                        print(f"[reuse] d{depth}  {url}")
-
-                if html is None:
-                    html = await _fetch_with_retries(
-                        page, url, retries=cfg.retries, timeout=cfg.timeout)
-                    status = "shell"
-                    if html is not None:
-                        status, _, links, _ = await asyncio.to_thread(
-                            parse_page, html, url, root, cfg.min_chars)
-                    if html is not None and status in ("ok", "thin"):
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        await asyncio.to_thread(dest.write_text, html, encoding="utf-8")
-                        stats["saved"] += 1
-                        if status == "thin":
-                            stats["thin"] += 1
-                        print(f"[{'save' if status=='ok' else 'thin'}] d{depth}  {url}")
-                    else:
+                links = await _read_cached(dest, url, root, cfg)
+                if links is not None:
+                    stats["reused"] += 1
+                    print(f"[reuse] d{depth}  {url}")
+                else:
+                    status, links = await _fetch_and_save(
+                        page, url, dest, root, cfg)
+                    if status not in USABLE_STATUSES:
                         stats["failed"] += 1
                         failures.append(url)
                         print(f"  ! FAILED ({status}): {url}", file=sys.stderr)
-                        if cfg.wait:
-                            await asyncio.sleep(cfg.wait)
+                        await _polite_wait(cfg)
                         continue
+                    stats["saved"] += 1
+                    if status == "thin":
+                        stats["thin"] += 1
+                    print(f"[{'save' if status == 'ok' else 'thin'}] d{depth}  {url}")
 
                 if cfg.max_pages and (stats["saved"] + stats["reused"]) >= cfg.max_pages:
                     stop.set()
@@ -252,8 +326,7 @@ async def _worker(ctx, queue, visited, cfg, root, out_dir, stats, failures, stop
                             visited.add(link)
                             queue.put_nowait((link, depth + 1))
 
-                if cfg.wait:
-                    await asyncio.sleep(cfg.wait)
+                await _polite_wait(cfg)
             finally:
                 queue.task_done()
     except asyncio.CancelledError:
@@ -262,8 +335,7 @@ async def _worker(ctx, queue, visited, cfg, root, out_dir, stats, failures, stop
         await page.close()
 
 
-async def _mirror(cfg):
-    import asyncio
+async def _mirror(cfg: SimpleNamespace) -> None:
     from playwright.async_api import async_playwright
 
     root = cfg.url
@@ -275,7 +347,7 @@ async def _mirror(cfg):
     queue: asyncio.Queue = asyncio.Queue()
     queue.put_nowait((root, 0))
     stats = {"saved": 0, "reused": 0, "failed": 0, "thin": 0}
-    failures = []
+    failures: list[str] = []
     stop = asyncio.Event()
 
     start = time.time()
@@ -308,7 +380,7 @@ async def _mirror(cfg):
 # STAGE 2 — EXTRACT (filter + rescue + convert to markdown)
 # ===========================================================================
 
-def _breadcrumb(soup):
+def _breadcrumb(soup) -> list[str]:
     ul = soup.find("ul", class_="breadcrumb")
     if not ul:
         return []
@@ -335,16 +407,12 @@ def _clean_body_md(section) -> str:
     return body
 
 
-def stage_extract(cfg):
-    html_dir = Path(cfg.html_dir)
-    files = sorted(html_dir.rglob("*.html"))
-    if not files:
-        print(f"[extract] no .html under {html_dir} — run the mirror stage first.",
-              file=sys.stderr)
-        sys.exit(1)
+def _index_pages(files: list[Path]) -> dict[str, dict]:
+    """Parse every mirrored page into a metadata record keyed by file name.
 
-    # Index every page.
-    index = {}
+    The page's BeautifulSoup <section> rides along under '_section' for the
+    conversion pass; underscore keys are stripped before serialization."""
+    index: dict[str, dict] = {}
     for path in files:
         html = path.read_text(encoding="utf-8", errors="replace")
         soup = BeautifulSoup(html, "lxml")
@@ -352,7 +420,6 @@ def stage_extract(cfg):
         section = tc.find("section") if tc else None
         crumbs = _breadcrumb(soup)
         h1 = soup.find("h1")
-        modified = section.get("data-time-modified", "") if section else ""
         links = []
         if section:
             for a in section.find_all("a", href=True):
@@ -364,26 +431,31 @@ def stage_extract(cfg):
             "title": h1.get_text(strip=True) if h1 else path.stem,
             "product": crumbs[0] if crumbs else "(unknown)",
             "breadcrumb": crumbs,
-            "modified": modified,
+            "modified": section.get("data-time-modified", "") if section else "",
             "links": sorted(set(links)),
             "has_content": section is not None,
             "_section": section,
         }
+    return index
 
-    # Classify.
-    inc = {x.strip().lower() for x in cfg.include}
-    exc = {x.strip().lower() for x in cfg.exclude}
-    for m_ in index.values():
-        p = m_["product"].strip().lower()
+
+def _classify(index: dict[str, dict], include: list[str], exclude: list[str]) -> None:
+    """Mark every page 'keep' or 'drop' by its breadcrumb root product."""
+    inc = {x.strip().lower() for x in include}
+    exc = {x.strip().lower() for x in exclude}
+    for meta in index.values():
+        product = meta["product"].strip().lower()
         if inc:
-            m_["status"] = "keep" if p in inc else "drop"
+            meta["status"] = "keep" if product in inc else "drop"
         else:
-            m_["status"] = "drop" if p in exc else "keep"
+            meta["status"] = "drop" if product in exc else "keep"
 
-    # Rescue cross-linked excluded pages.
-    for _ in range(max(0, cfg.rescue_depth)):
+
+def _rescue_linked(index: dict[str, dict], rescue_depth: int) -> None:
+    """Promote dropped pages that kept pages link to, up to `rescue_depth` hops."""
+    for _ in range(max(0, rescue_depth)):
         promoted = 0
-        for src in [m_ for m_ in index.values() if m_["status"] in ("keep", "rescued")]:
+        for src in [m for m in index.values() if m["status"] in ("keep", "rescued")]:
             for name in src["links"]:
                 tgt = index.get(name)
                 if tgt and tgt["status"] == "drop":
@@ -393,24 +465,29 @@ def stage_extract(cfg):
         if promoted == 0:
             break
 
-    # Title-based exclusion: force-drop low-value noise (version notes etc.)
-    title_rx = [re.compile(p, re.I) for p in cfg.title_exclude]
-    title_dropped = 0
-    for m_ in index.values():
-        if m_["status"] in ("keep", "rescued") and any(rx.search(m_["title"]) for rx in title_rx):
-            m_["status"] = "drop"
-            m_["drop_reason"] = "title-excluded"
-            title_dropped += 1
 
-    # Convert kept/rescued bodies; assemble records (dedup identical bodies).
-    records = []
-    seen_bodies = set()
+def _drop_by_title(index: dict[str, dict], patterns: list[str]) -> int:
+    """Force-drop low-value noise (version notes etc.) by title."""
+    filters = compile_title_filters(patterns)
+    dropped = 0
+    for meta in index.values():
+        if meta["status"] in ("keep", "rescued") and title_excluded(meta["title"], filters):
+            meta["status"] = "drop"
+            meta["drop_reason"] = "title-excluded"
+            dropped += 1
+    return dropped
+
+
+def _build_records(index: dict[str, dict]) -> tuple[list[dict], int]:
+    """Convert kept/rescued bodies to Markdown → (records, duplicates_dropped)."""
+    records: list[dict] = []
+    seen_bodies: set[str] = set()
     dupes = 0
-    for m_ in index.values():
-        rec = {k: v for k, v in m_.items() if not k.startswith("_")}
-        if m_["status"] in ("keep", "rescued") and m_["has_content"]:
-            body = _clean_body_md(m_["_section"])
-            key = hash(body)
+    for meta in index.values():
+        rec = {k: v for k, v in meta.items() if not k.startswith("_")}
+        if meta["status"] in ("keep", "rescued") and meta["has_content"]:
+            body = _clean_body_md(meta["_section"])
+            key = digest(body)
             if key in seen_bodies:
                 rec["status"] = "drop"
                 rec["drop_reason"] = "duplicate"
@@ -419,6 +496,22 @@ def stage_extract(cfg):
                 seen_bodies.add(key)
                 rec["markdown"] = body
         records.append(rec)
+    return records, dupes
+
+
+def stage_extract(cfg: SimpleNamespace) -> None:
+    html_dir = Path(cfg.html_dir)
+    files = sorted(html_dir.rglob("*.html"))
+    if not files:
+        print(f"[extract] no .html under {html_dir} — run the mirror stage first.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    index = _index_pages(files)
+    _classify(index, cfg.include, cfg.exclude)
+    _rescue_linked(index, cfg.rescue_depth)
+    title_dropped = _drop_by_title(index, cfg.title_exclude)
+    records, dupes = _build_records(index)
 
     Path(cfg.json_path).write_text(json.dumps(records, indent=2), encoding="utf-8")
 
@@ -458,7 +551,23 @@ def _demote_headings(body: str, by: int = 2) -> str:
     return "\n".join(out).strip()
 
 
-def stage_combine(cfg):
+def _page_lines(rec: dict) -> list[str]:
+    """One page as an H3 block: title, provenance line, demoted body."""
+    meta = []
+    if rec["breadcrumb"]:
+        meta.append(" › ".join(rec["breadcrumb"]))
+    if rec["modified"]:
+        meta.append(f"Modified: {rec['modified']}")
+    meta.append(f"Source: {rec['file']}")
+    return [
+        f"### {rec['title']}\n",
+        f"_{' · '.join(meta)}_\n",
+        _demote_headings(rec["markdown"]),
+        "",
+    ]
+
+
+def stage_combine(cfg: SimpleNamespace) -> None:
     records = json.loads(Path(cfg.json_path).read_text(encoding="utf-8"))
     kept = [r for r in records if r["status"] == "keep" and r.get("markdown")]
     rescued = [r for r in records if r["status"] == "rescued" and r.get("markdown")]
@@ -470,8 +579,7 @@ def stage_combine(cfg):
     for lst in by_product.values():
         lst.sort(key=lambda r: (r["breadcrumb"], r["title"]))
 
-    ordered = [p for p in cfg.product_order if p in by_product]
-    ordered += sorted(p for p in by_product if p not in cfg.product_order)
+    ordered = order_products(by_product, cfg.product_order)
 
     lines = []
     lines.append(f"# {cfg.doc_title}\n")
@@ -481,26 +589,8 @@ def stage_combine(cfg):
     lines.append(f"_Pages: {len(kept)} kept across {len(ordered)} products; "
                  f"{len(rescued)} referenced. Excluded: {excluded}._\n")
 
-    # Top-level contents (products only — page lists live in each section).
-    lines.append("## Contents\n")
-    for p in ordered:
-        lines.append(f"- [{p}](#{slugify(p)}) ({len(by_product[p])} pages)")
-    if rescued:
-        lines.append(f"- [Referenced Material](#referenced-material) "
-                     f"({len(rescued)} pages)")
-    lines.append("")
-
-    def emit_page(r):
-        lines.append(f"### {r['title']}\n")
-        meta = []
-        if r["breadcrumb"]:
-            meta.append(" › ".join(r["breadcrumb"]))
-        if r["modified"]:
-            meta.append(f"Modified: {r['modified']}")
-        meta.append(f"Source: {r['file']}")
-        lines.append(f"_{' · '.join(meta)}_\n")
-        lines.append(_demote_headings(r["markdown"]))
-        lines.append("")
+    lines += contents_lines(
+        ordered, {p: len(by_product[p]) for p in ordered}, len(rescued))
 
     for p in ordered:
         lines.append(f"## {p}\n")
@@ -509,7 +599,7 @@ def stage_combine(cfg):
             lines.append(f"- {r['title']}")
         lines.append("")
         for r in by_product[p]:
-            emit_page(r)
+            lines += _page_lines(r)
 
     if rescued:
         lines.append("## Referenced Material\n")
@@ -517,7 +607,7 @@ def stage_combine(cfg):
                      "by kept content (e.g. supported-language tables)._\n")
         rescued.sort(key=lambda r: (r["product"], r["title"]))
         for r in rescued:
-            emit_page(r)
+            lines += _page_lines(r)
 
     Path(cfg.md_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     size = Path(cfg.md_path).stat().st_size
@@ -529,80 +619,90 @@ def stage_combine(cfg):
 # STAGE 4 — COMPRESS (shrink an existing canonical .md, in place or to a copy)
 # ===========================================================================
 
-def stage_compress(cfg):
-    """Post-process an existing canonical doc: drop title-excluded pages and
-    exact-duplicate pages, normalize line endings, rebuild Contents + counts.
+Block = tuple[str, str]                    # (page title, verbatim block text)
 
-    Operates on the rendered .md directly (verbatim page blocks are preserved —
-    no re-conversion, so nothing is paraphrased or restructured)."""
+
+def _split_canonical(text: str) -> tuple[dict[str, list[Block]], list[Block]]:
+    """Split a rendered canonical doc back into per-product page blocks.
+
+    Returns (product -> [(title, block)], referenced_blocks). Block text is kept
+    verbatim so the re-render never paraphrases or restructures content."""
+    sections: dict[str, list[Block]] = {}
+    referenced: list[Block] = []
+    current_product: str | None = None
+    in_referenced = False
+    cur_title: str | None = None
+    cur_buf: list[str] = []
+
+    def flush() -> None:
+        if cur_title is None:
+            return
+        block = "\n".join(cur_buf).rstrip() + "\n"
+        if in_referenced:
+            referenced.append((cur_title, block))
+        elif current_product is not None:
+            sections.setdefault(current_product, []).append((cur_title, block))
+
+    for ln in text.split("\n"):
+        if ln.startswith("## "):
+            flush()
+            cur_title, cur_buf = None, []
+            name = ln[3:].strip()
+            if name.lower() == "contents":
+                current_product, in_referenced = None, False
+            elif name.lower() == "referenced material":
+                current_product, in_referenced = None, True
+            else:
+                current_product, in_referenced = name, False
+            continue
+        if ln.startswith("### "):
+            flush()
+            cur_title, cur_buf = ln[4:].strip(), []
+            continue
+        if cur_title is not None:
+            cur_buf.append(ln)
+    flush()
+    return sections, referenced
+
+
+def stage_compress(cfg: SimpleNamespace) -> None:
+    """Post-process an existing canonical doc: drop title-excluded pages and
+    exact-duplicate pages, normalize line endings, rebuild Contents + counts."""
     src = Path(cfg.md_path)
     text = src.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
 
     h1 = next((ln[2:].strip() for ln in text.split("\n") if ln.startswith("# ")),
               cfg.doc_title)
-
-    # Walk lines; track current product (## heading) and split into ### blocks.
-    title_rx = [re.compile(p, re.I) for p in cfg.title_exclude]
-    sections: dict[str, list] = {}     # product -> list[(title, block_text)]
-    referenced: list = []
-    current_product = None
-    in_referenced = False
-    cur_title = None
-    cur_buf: list[str] = []
-
-    def flush():
-        if cur_title is None:
-            return
-        block = "\n".join(cur_buf).rstrip() + "\n"
-        target = referenced if in_referenced else sections.setdefault(current_product, [])
-        if in_referenced:
-            referenced.append((cur_title, block))
-        else:
-            sections.setdefault(current_product, []).append((cur_title, block))
-
-    for ln in text.split("\n"):
-        if ln.startswith("## "):
-            flush(); cur_title, cur_buf = None, []
-            name = ln[3:].strip()
-            if name.lower() == "contents":
-                current_product = None
-            elif name.lower() == "referenced material":
-                in_referenced = True; current_product = None
-            else:
-                in_referenced = False; current_product = name
-            continue
-        if ln.startswith("### "):
-            flush()
-            cur_title = ln[4:].strip(); cur_buf = []
-            continue
-        if cur_title is not None:
-            cur_buf.append(ln)
-    flush()
+    sections, referenced = _split_canonical(text)
 
     # Filter: drop title-excluded + exact-duplicate blocks.
-    seen = set(); dropped_title = 0; dropped_dupe = 0
-    def keep_block(title, block):
+    filters = compile_title_filters(cfg.title_exclude)
+    seen: set[str] = set()
+    dropped_title = 0
+    dropped_dupe = 0
+
+    def keep_block(title: str, block: str) -> bool:
         nonlocal dropped_title, dropped_dupe
-        if any(rx.search(title) for rx in title_rx):
-            dropped_title += 1; return False
+        if title_excluded(title, filters):
+            dropped_title += 1
+            return False
         # Hash the body only — strip the leading _..._ provenance line so that
         # the same content served at different URLs dedupes despite differing Source:.
         body = re.sub(r"^\s*_[^\n]*_\s*\n", "", block, count=1)
-        key = hash(body.strip())
+        key = digest(body)
         if key in seen:
-            dropped_dupe += 1; return False
-        seen.add(key); return True
+            dropped_dupe += 1
+            return False
+        seen.add(key)
+        return True
 
-    ordered = [p for p in cfg.product_order if p in sections]
-    ordered += sorted(p for p in sections if p not in cfg.product_order)
-
-    kept_sections = {}
-    for p in ordered:
+    kept_sections: dict[str, list[Block]] = {}
+    for p in order_products(sections, cfg.product_order):
         blocks = [(t, b) for (t, b) in sections[p] if keep_block(t, b)]
         if blocks:
             kept_sections[p] = blocks
     kept_ref = [(t, b) for (t, b) in referenced if keep_block(t, b)]
-    ordered = [p for p in ordered if p in kept_sections]
+    ordered = order_products(kept_sections, cfg.product_order)
 
     total_pages = sum(len(v) for v in kept_sections.values()) + len(kept_ref)
 
@@ -612,13 +712,9 @@ def stage_compress(cfg):
            f"_Pages: {total_pages} across {len(ordered)} products; "
            f"{len(kept_ref)} referenced. "
            f"Removed {dropped_title} version/changelog pages and "
-           f"{dropped_dupe} duplicates._\n",
-           "## Contents\n"]
-    for p in ordered:
-        out.append(f"- [{p}](#{slugify(p)}) ({len(kept_sections[p])} pages)")
-    if kept_ref:
-        out.append(f"- [Referenced Material](#referenced-material) ({len(kept_ref)} pages)")
-    out.append("")
+           f"{dropped_dupe} duplicates._\n"]
+    out += contents_lines(
+        ordered, {p: len(kept_sections[p]) for p in ordered}, len(kept_ref))
 
     for p in ordered:
         out.append(f"## {p}\n")
@@ -650,32 +746,39 @@ def stage_compress(cfg):
 # CLI
 # ===========================================================================
 
-def build_cfg(args) -> SimpleNamespace:
-    """Merge CONFIG defaults with any command-line overrides."""
+def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
+    """Merge CONFIG defaults with any command-line overrides.
+
+    Every override defaults to None, so `pick` treats 'not passed' as 'use the
+    CONFIG value' while still honouring falsy-but-explicit flags like
+    `--include` with no arguments."""
+    def pick(value, default):
+        return default if value is None else value
+
     return SimpleNamespace(
-        url=args.url or START_URL,
-        include=args.include if args.include is not None else INCLUDE_PRODUCTS,
-        exclude=args.exclude if args.exclude is not None else EXCLUDE_PRODUCTS,
-        rescue_depth=args.rescue_depth if args.rescue_depth is not None else RESCUE_DEPTH,
-        min_chars=args.min_chars if args.min_chars is not None else MIN_CHARS,
-        concurrency=args.concurrency if args.concurrency is not None else CONCURRENCY,
-        depth=args.depth if args.depth is not None else MAX_DEPTH,
-        timeout=args.timeout if args.timeout is not None else NAV_TIMEOUT_MS,
-        retries=args.retries if args.retries is not None else RETRIES,
-        wait=args.wait if args.wait is not None else POLITE_WAIT,
-        max_pages=args.max_pages if args.max_pages is not None else 0,
+        url=pick(args.url, START_URL),
+        include=pick(args.include, INCLUDE_PRODUCTS),
+        exclude=pick(args.exclude, EXCLUDE_PRODUCTS),
+        rescue_depth=pick(args.rescue_depth, RESCUE_DEPTH),
+        min_chars=pick(args.min_chars, MIN_CHARS),
+        concurrency=pick(args.concurrency, CONCURRENCY),
+        depth=pick(args.depth, MAX_DEPTH),
+        timeout=pick(args.timeout, NAV_TIMEOUT_MS),
+        retries=pick(args.retries, RETRIES),
+        wait=pick(args.wait, POLITE_WAIT),
+        max_pages=pick(args.max_pages, 0),
         force=args.force,
-        html_dir=args.html_dir or HTML_DIR,
-        json_path=args.json_path or EXTRACT_JSON,
-        md_path=args.md_path or CANONICAL_MD,
+        html_dir=pick(args.html_dir, HTML_DIR),
+        json_path=pick(args.json_path, EXTRACT_JSON),
+        md_path=pick(args.md_path, CANONICAL_MD),
         md_out=args.md_out,
-        title_exclude=args.title_exclude if args.title_exclude is not None else TITLE_EXCLUDE_PATTERNS,
-        doc_title=args.doc_title or DOC_TITLE,
+        title_exclude=pick(args.title_exclude, TITLE_EXCLUDE_PATTERNS),
+        doc_title=pick(args.doc_title, DOC_TITLE),
         product_order=PRODUCT_ORDER,
     )
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(
         description="Checkmarx docs pipeline: mirror -> extract -> combine.")
     ap.add_argument("--stage", choices=["mirror", "extract", "combine", "compress", "all"],
