@@ -16,8 +16,11 @@ that write to separate outputs:
 
   API SPEC   (live tenant catalog + Stoplight -> one OpenAPI 3.0.3 candidate)
     api-spec     Fetch both sources, merge them, and report drift against a
-                 baseline spec. Everything lands in ./api-spec/ and never mixes
+                 baseline spec. Everything lands in ./api/ and never mixes
                  with the user-docs files. See cx_api_spec.py for the details.
+
+Outputs go to exactly two folders: docs/ (user docs) and api/ (API spec).
+The README lists every file, what it contains and what it is for.
 
 Run everything (default), or any part in isolation:
 
@@ -121,9 +124,13 @@ RETRIES = 3
 POLITE_WAIT = 0.3          # per-worker delay between pages (seconds)
 
 # --- Output paths -----------------------------------------------------------
-HTML_DIR = "cx-docs"                       # mirror output (pages land in <HTML_DIR>/en/)
-EXTRACT_JSON = "cx-extracted.json"         # intermediate: records + bodies + audit
-CANONICAL_MD = "checkmarx-one-docs.md"     # final single-file deliverable
+# Every user-docs output lives under DOCS_DIR (the API stage writes only to api/).
+# The state, manifest, change report and failures.log sit next to the pages
+# directory, so they follow it if --html-dir is overridden.
+DOCS_DIR = "docs"
+HTML_DIR = f"{DOCS_DIR}/pages"                       # cached HTML mirror (pages land in <HTML_DIR>/en/)
+EXTRACT_JSON = f"{DOCS_DIR}/cx-extracted.json"       # TEMPORARY: removed after combine (see --keep-temp)
+CANONICAL_MD = f"{DOCS_DIR}/checkmarx-one-docs.md"   # final single-file deliverable (dated on write)
 
 # --- Canonical document framing --------------------------------------------
 DOC_TITLE = "Checkmarx One — Documentation (Filtered Mirror)"
@@ -225,6 +232,29 @@ def digest(text: str) -> str:
     Uses sha256 rather than hash() so the same body produces the same key in
     every process, regardless of PYTHONHASHSEED."""
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def _write_text(path, text: str) -> None:
+    """Write via a sibling .tmp file, then rename, so an interrupted run never
+    leaves a half-written output; the .tmp file is always removed."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, p)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _sweep_tmp(root) -> int:
+    """Delete .tmp files left behind by a run that was killed mid-write."""
+    n = 0
+    if Path(root).is_dir():
+        for f in Path(root).rglob("*.tmp"):
+            f.unlink(missing_ok=True)
+            n += 1
+    return n
 
 
 def _dated_path(path: str) -> str:
@@ -437,7 +467,7 @@ async def _process(url: str, product: str, client, cfg, out_dir: Path, state: di
             print(f"[same]      {url}")
         else:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(dest.write_text, html, encoding="utf-8")
+            await asyncio.to_thread(_write_text, dest, html)
             kind = "updated" if cached else "new"
             stats[kind] += 1
             changes[kind].append(entry | {"url": url, "prev_modified": prev.get("topic_modified", "")})
@@ -468,7 +498,7 @@ def _write_change_report(path: Path, changes: dict, removed: list[dict]) -> None
     block("New pages", changes["new"])
     block("Updated pages", changes["updated"], show_prev=True)
     block("Removed from nav (renamed or unpublished)", removed)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_text(path, "\n".join(lines) + "\n")
 
 
 async def _mirror(cfg: SimpleNamespace) -> None:
@@ -477,6 +507,7 @@ async def _mirror(cfg: SimpleNamespace) -> None:
     out_dir = Path(cfg.html_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     base = out_dir.parent
+    _sweep_tmp(base)
     state_path, manifest_path = base / STATE_FILE, base / MANIFEST_FILE
     fail_log = base / "failures.log"
     state: dict = (json.loads(state_path.read_text(encoding="utf-8"))
@@ -526,12 +557,14 @@ async def _mirror(cfg: SimpleNamespace) -> None:
         for u in [u for u in state if u not in live]:
             removed.append(state.pop(u) | {"url": u})
 
-    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    manifest_path.write_text(json.dumps(sorted(set(manifest)), indent=2), encoding="utf-8")
+    _write_text(state_path, json.dumps(state, indent=2))
+    _write_text(manifest_path, json.dumps(sorted(set(manifest)), indent=2))
     report = base / f"changes-{time.strftime('%Y-%m-%d')}.md"
     _write_change_report(report, changes, removed)
     if failures:
-        fail_log.write_text("\n".join(failures) + "\n", encoding="utf-8")
+        _write_text(fail_log, "\n".join(failures) + "\n")
+    else:
+        fail_log.unlink(missing_ok=True)      # don't leave last run's failures looking current
 
     stale = [p for p in out_dir.rglob("*.html")
              if p.relative_to(out_dir).as_posix() not in set(manifest)]
@@ -695,7 +728,7 @@ def stage_extract(cfg: SimpleNamespace) -> None:
     title_dropped = _drop_by_title(index, cfg.title_exclude)
     records, dupes = _build_records(index)
 
-    Path(cfg.json_path).write_text(json.dumps(records, indent=2), encoding="utf-8")
+    _write_text(cfg.json_path, json.dumps(records, indent=2))
 
     kept = sum(1 for r in records if r["status"] == "keep")
     resc = sum(1 for r in records if r["status"] == "rescued")
@@ -764,6 +797,8 @@ def _newest_modified(records: list[dict]) -> str:
 
 
 def stage_combine(cfg: SimpleNamespace) -> None:
+    if not Path(cfg.json_path).is_file():
+        sys.exit(f"[combine] {cfg.json_path} not found - run the extract stage first")
     records = json.loads(Path(cfg.json_path).read_text(encoding="utf-8"))
     kept = [r for r in records if r["status"] == "keep" and r.get("markdown")]
     rescued = [r for r in records if r["status"] == "rescued" and r.get("markdown")]
@@ -808,10 +843,13 @@ def stage_combine(cfg: SimpleNamespace) -> None:
         for r in rescued:
             lines += _page_lines(r)
 
-    Path(cfg.md_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_text(cfg.md_path, "\n".join(lines) + "\n")
     size = Path(cfg.md_path).stat().st_size
     print(f"[combine] wrote {cfg.md_path} — {len(kept)+len(rescued)} pages, "
           f"{size/1_048_576:.2f} MB")
+    if not cfg.keep_temp:        # the extract JSON is an intermediate, rebuilt by the next extract
+        Path(cfg.json_path).unlink(missing_ok=True)
+        print(f"[combine] removed temporary {cfg.json_path} (use --keep-temp to keep it)")
 
 
 # ===========================================================================
@@ -933,7 +971,7 @@ def stage_compress(cfg: SimpleNamespace) -> None:
             out.append("")
 
     dest = Path(cfg.md_out or cfg.md_path)
-    dest.write_text("\n".join(out) + "\n", encoding="utf-8")
+    _write_text(dest, "\n".join(out) + "\n")
     before = src.stat().st_size
     after = dest.stat().st_size
     print(f"[compress] {dest} — {total_pages} pages, "
@@ -971,6 +1009,7 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
         json_path=pick(args.json_path, EXTRACT_JSON),
         md_path=_dated_path(pick(args.md_path, CANONICAL_MD)),
         md_out=args.md_out,
+        keep_temp=args.keep_temp,
         title_exclude=pick(args.title_exclude, TITLE_EXCLUDE_PATTERNS),
         doc_title=pick(args.doc_title, DOC_TITLE),
         product_order=PRODUCT_ORDER,
@@ -1004,6 +1043,8 @@ def main() -> None:
     ap.add_argument("--md-out", help="Output path for the compress stage (default: overwrite --md-path)")
     ap.add_argument("--title-exclude", nargs="*", help="Regexes; drop pages whose title matches")
     ap.add_argument("--doc-title")
+    ap.add_argument("--keep-temp", action="store_true",
+                    help="Keep the temporary extract JSON after combine (deleted by default)")
     import cx_api_spec          # no third-party imports at module load, so docs-only runs stay light
     cx_api_spec.add_arguments(ap)
     args = ap.parse_args()

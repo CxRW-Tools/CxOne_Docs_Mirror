@@ -1,14 +1,11 @@
-# Pipeline output artifacts (generated data, never commit)
-cx-docs/
-cx-extracted*.json
-checkmarx-one-docs*.md
-changes-*.md
-manifest.json
-mirror-state.json
-failures.log
+# Generated output. The tool writes only to docs/ (user docs) and api/ (API spec);
+# api/overlay/ holds hand-maintained input and stays tracked.
+/docs/
+/api/*
+!/api/overlay/
 
-# API spec stage output (raw downloads, merged spec, drift, history)
-api-spec/
+# Local scanner state
+.checkmarx/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
