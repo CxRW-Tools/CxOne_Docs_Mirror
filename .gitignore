@@ -1,7 +1,10 @@
-# Pipeline output artifacts
+# Pipeline output artifacts (generated data, never commit)
 cx-docs/
-cx-extracted.json
-checkmarx-one-docs.md
+cx-extracted*.json
+checkmarx-one-docs*.md
+changes-*.md
+manifest.json
+mirror-state.json
 failures.log
 
 # Byte-compiled / optimized / DLL files
