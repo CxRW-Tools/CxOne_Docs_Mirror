@@ -1,19 +1,20 @@
 # Dependencies for cx_docs_mirror.py (Python 3.9+).
 #
 #   python -m pip install -r requirements.txt
-#   python -m playwright install chromium    # browser binary — mirror stage only
 #
-# On Windows use `py -m ...` for both. Prefer the `python -m` form over a bare
-# `playwright install`: the console script lands in the interpreter's Scripts/
-# bin directory, which is frequently not on PATH (pip warns about this at
-# install time), whereas `-m` always resolves against the running interpreter.
-# Only chromium is needed; a bare `playwright install` also fetches Firefox and
-# WebKit.
+# On Windows use `py -m pip ...`. The `-m` form always installs into the
+# interpreter you'll run the script with, which avoids PATH surprises.
 #
-# playwright is imported lazily inside the mirror stage, so the extract,
-# combine and compress stages run with just the three parsing libraries.
+# httpx is imported lazily inside the mirror stage, so the extract, combine
+# and compress stages run with just the three parsing libraries.
+#
+# Playwright is no longer used: docs.checkmarx.com serves topic content as
+# static HTML, so the mirror stage fetches pages over plain HTTP. If nothing
+# else on this machine needs it, you can remove it and its browser binaries:
+#   python -m pip uninstall playwright
+#   (then delete the ms-playwright folder under %LOCALAPPDATA% on Windows)
 
-beautifulsoup4>=4.12,<5     # HTML parsing / breadcrumb + content extraction
+beautifulsoup4>=4.12,<5     # HTML parsing / nav, breadcrumb + content extraction
 lxml>=5.0,<7                # parser backend used by BeautifulSoup("lxml")
 markdownify>=0.13,<2        # HTML -> Markdown conversion
-playwright>=1.40,<2         # headless Chromium crawl (mirror stage)
+httpx>=0.25,<1              # async HTTP client (mirror stage)

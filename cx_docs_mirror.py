@@ -2,7 +2,9 @@
 """
 cx_docs_mirror.py — End-to-end Checkmarx docs pipeline in four stages:
 
-    1. MIRROR    Crawl the docs site (concurrent, verifying, retrying) to HTML.
+    1. MIRROR    Read the live nav, fetch allowed pages over plain HTTP, and
+                 write only pages whose topic content changed. Produces a
+                 manifest, a state file, and a changes-<date>.md report.
     2. EXTRACT   Filter by product, rescue cross-linked exceptions, convert the
                  real content of each kept page to faithful Markdown.
     3. COMBINE   Merge everything into ONE canonical .md with a clean heading
@@ -25,13 +27,10 @@ overridden on the command line — see `--help`.
 ------------------------------------------------------------------------------
 SETUP (Python 3.9+):
     python -m pip install -r requirements.txt
-    python -m playwright install chromium   # only needed for the mirror stage
+    (needs: httpx, beautifulsoup4, lxml, markdownify. Playwright is no longer
+    used; the docs site serves topic content as static HTML.)
 
-Invoke both through `python -m` (`py -m` on Windows). Plain `playwright
-install` needs the interpreter's Scripts/bin directory on PATH, which it often
-is not; the module form always resolves to the interpreter you just installed
-into. Only chromium is used — a bare `playwright install` also fetches Firefox
-and WebKit.
+Use --force to refetch and rewrite every page regardless of cache.
 ------------------------------------------------------------------------------
 """
 
@@ -45,6 +44,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urldefrag, urljoin, urlparse
@@ -104,9 +104,9 @@ TITLE_EXCLUDE_PATTERNS: list[str] = [
 ]
 
 # --- Crawl tuning -----------------------------------------------------------
-CONCURRENCY = 12
-MAX_DEPTH = 3
-NAV_TIMEOUT_MS = 45000
+CONCURRENCY = 8            # simultaneous HTTP requests
+MAX_DEPTH = 3              # unused since the nav-driven mirror; kept for CLI compatibility
+NAV_TIMEOUT_MS = 45000     # per-request HTTP timeout (ms)
 RETRIES = 3
 POLITE_WAIT = 0.3          # per-worker delay between pages (seconds)
 
@@ -252,271 +252,288 @@ def contents_lines(ordered: list[str], counts: dict[str, int],
 
 
 # ===========================================================================
-# STAGE 1 — MIRROR (concurrent, verifying, retrying)
+# STAGE 1 — MIRROR (live nav → conditional HTTP fetch → change detection)
 # ===========================================================================
+#
+# How a run works:
+#   1. GET the start page once and read the full sidebar nav. Every page on
+#      the site embeds the whole tree, so this one request lists every live
+#      URL and the top-level product each one sits under. Only URLs under
+#      INCLUDE_PRODUCTS are fetched; excluded products are never requested.
+#   2. For each URL, send a plain HTTP GET (browser headers, no Playwright).
+#      If we have a cached copy and a stored Last-Modified, it's sent as
+#      If-Modified-Since; a 304 means the page is unchanged.
+#   3. On a 200, the topic body (#topic-content section) is hashed and compared
+#      with the cached copy. Only real content changes are written to disk.
+#      The sidebar is ignored for comparison, since it changes on every page
+#      whenever anything is added to the site.
+#   4. Write manifest.json (the files that are live this run) so the extract
+#      stage ignores stale cached slugs, plus mirror-state.json (hashes,
+#      dates, titles) and a changes-<date>.md report of new/updated/removed.
+
+STATE_FILE = "mirror-state.json"
+MANIFEST_FILE = "manifest.json"
+
+HTTP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 def stage_mirror(cfg: SimpleNamespace) -> None:
     asyncio.run(_mirror(cfg))
 
 
-async def _fetch_with_retries(page, url: str, *, retries: int, timeout: int,
-                              settle_ms: int = 6000) -> str | None:
-    """Load `url`, escalating the timeout on each attempt.
-
-    Early attempts insist on the real content selector; the final attempt
-    settles for domcontentloaded plus a fixed wait, which is enough for pages
-    that render slowly but are otherwise fine."""
-    last_html = None
-    for attempt in range(retries):
-        is_final = attempt == retries - 1
-        t = int(timeout * (1 + 0.5 * attempt))
-        try:
-            if is_final:
-                await page.goto(url, wait_until="domcontentloaded", timeout=t)
-                await page.wait_for_timeout(settle_ms)
-            else:
-                await page.goto(url, wait_until="load", timeout=t)
-                await page.wait_for_selector("#topic-content", timeout=t)
-            last_html = await page.content()
-            return last_html
-        except Exception as e:
-            if is_final:
-                print(f"      attempt {attempt+1}/{retries} failed: "
-                      f"{str(e).splitlines()[0]}", file=sys.stderr)
-            else:
-                await asyncio.sleep(2 * (attempt + 1))
-    return last_html
-
-
-async def _read_cached(dest: Path, url: str, root: str,
-                       cfg: SimpleNamespace) -> tuple[str | None, set[str]] | None:
-    """Return (product_root, links) for a usable cached page, or None to refetch."""
-    if not dest.exists() or cfg.force:
-        return None
-    existing = await asyncio.to_thread(
-        dest.read_text, encoding="utf-8", errors="replace")
-    status, product_root, links = await asyncio.to_thread(
-        parse_page, existing, url, root, cfg.min_chars)
-    return (product_root, links) if status in USABLE_STATUSES else None
-
-
-async def _fetch_parse(page, url: str, root: str,
-                       cfg: SimpleNamespace) -> tuple[str, str | None, str | None, set[str]]:
-    """Fetch and parse one page → (status, product_root, html, links).
-
-    Does NOT write to disk; the caller decides whether to save based on the
-    breadcrumb product before committing I/O."""
-    html = await _fetch_with_retries(
-        page, url, retries=cfg.retries, timeout=cfg.timeout)
-    if html is None:
-        return "shell", None, None, set()
-    status, product_root, links = await asyncio.to_thread(
-        parse_page, html, url, root, cfg.min_chars)
-    if status not in USABLE_STATUSES:
-        return status, product_root, None, set()
-    return status, product_root, html, links
-
-
-async def _save_page(html: str, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(dest.write_text, html, encoding="utf-8")
-
-
-async def _polite_wait(cfg: SimpleNamespace) -> None:
-    if cfg.wait:
-        await asyncio.sleep(cfg.wait)
-
-
-def _is_excluded(product_root: str | None, allowed: set[str]) -> bool:
-    """True when this page's breadcrumb product is not in the allowlist.
-
-    When the allowlist is empty no filtering is applied (crawl everything)."""
-    if not allowed:
-        return False
-    return (product_root or "").strip().lower() not in allowed
-
-
-async def _discover_seed_urls(page, cfg: SimpleNamespace, start_url: str) -> list[str]:
-    """Load the docs start page, parse the navigation sidebar, and return root
-    URLs for each allowed product.
-
-    Tries several common nav/sidebar CSS selectors. If none match or no seeds
-    are found, falls back to [start_url] and breadcrumb-based filtering alone."""
-    try:
-        await page.goto(start_url, wait_until="domcontentloaded", timeout=cfg.timeout)
-        html = await page.content()
-    except Exception as e:
-        print(f"[mirror] seed discovery failed ({e!s:.80}); "
-              f"falling back to start URL", file=sys.stderr)
-        return [start_url]
-
+def _topic_info(html: str) -> tuple[str | None, str, str, str]:
+    """→ (body_hash or None if no topic section, title, topic_modified, breadcrumb root)."""
     soup = BeautifulSoup(html, "lxml")
-    include_lower = {p.strip().lower() for p in cfg.include}
+    tc = soup.find(id="topic-content")
+    section = tc.find("section") if tc else None
+    h1 = soup.find("h1")
+    title = h1.get_text(strip=True) if h1 else ""
+    crumbs = _breadcrumb(soup)
+    if section is None:
+        return None, title, "", crumbs[0] if crumbs else ""
+    text = section.get_text(" ", strip=True)
+    return (digest(text), title, section.get("data-time-modified", ""),
+            crumbs[0] if crumbs else "")
 
-    # Walk candidate nav selectors, stop at the first that exists.
-    # aside/ul.toc precede 'nav' intentionally: on MadCap Flare sites the
-    # <nav> tag is the top header bar, not the sidebar product tree.
-    nav_root = None
+
+def _nav_root(soup):
+    """Same selector cascade as before: aside/ul.toc before <nav>, because on
+    this site <nav> is the header bar, not the product tree."""
     for sel_type, sel_val in [
-        ("tag",   "aside"),
-        ("class", "nav-site-sidebar"),
-        ("class", "toc"),
-        ("class", "sidenav"),
-        ("class", "navigation"),
-        ("id",    "navigation"),
-        ("class", "sidebar"),
-        ("id",    "sidebar"),
-        ("tag",   "nav"),
+        ("tag", "aside"), ("class", "nav-site-sidebar"), ("class", "toc"),
+        ("class", "sidenav"), ("class", "navigation"), ("id", "navigation"),
+        ("class", "sidebar"), ("id", "sidebar"), ("tag", "nav"),
     ]:
         if sel_type == "tag":
-            nav_root = soup.find(sel_val)
+            el = soup.find(sel_val)
         elif sel_type == "class":
-            nav_root = soup.find(class_=sel_val)
+            el = soup.find(class_=sel_val)
         else:
-            nav_root = soup.find(id=sel_val)
-        if nav_root:
-            break
-    search_scope = nav_root if nav_root else soup
+            el = soup.find(id=sel_val)
+        if el:
+            return el
+    return None
 
-    seeds: list[str] = []
-    seen: set[str] = set()
-    for a in search_scope.find_all("a", href=True):
-        text = a.get_text(strip=True).lower()
-        if not any(inc in text or text in inc for inc in include_lower):
+
+def _discover_from_nav(html: str, cfg: SimpleNamespace) -> tuple[dict[str, str], set[str]]:
+    """Parse the sidebar → ({url: product} for allowed products, all product names seen).
+
+    A link's product is the first link of its OUTERMOST <li> inside the nav
+    tree, i.e. the top-level product node it hangs under."""
+    soup = BeautifulSoup(html, "lxml")
+    root = _nav_root(soup)
+    if root is None:
+        return {}, set()
+    allowed = {p.strip().lower() for p in cfg.include}
+    urls: dict[str, str] = {}
+    seen_products: set[str] = set()
+    for a in root.find_all("a", href=True):
+        outer = None
+        for parent in a.parents:
+            if parent is root:
+                break
+            if parent.name == "li":
+                outer = parent
+        if outer is None:
             continue
-        url, _ = urldefrag(urljoin(start_url, a["href"]))
-        if url in seen or not is_in_scope(url, start_url):
+        head = outer.find("a")
+        product = head.get_text(strip=True) if head else ""
+        if not product:
             continue
-        seen.add(url)
-        seeds.append(url)
-
-    if seeds:
-        print(f"[mirror] {len(seeds)} seed URL(s) from nav tree:")
-        for s in seeds:
-            print(f"         {s}")
-    else:
-        print("[mirror] no nav seeds matched; "
-              "falling back to start URL + breadcrumb filtering", file=sys.stderr)
-        seeds = [start_url]
-
-    return seeds
+        seen_products.add(product)
+        if allowed and product.lower() not in allowed:
+            continue
+        url, _ = urldefrag(urljoin(cfg.url, a["href"]))
+        if is_in_scope(url, cfg.url):
+            urls.setdefault(url, product)
+    return urls, seen_products
 
 
-async def _worker(ctx, queue, visited, visited_lock, cfg, root, out_dir, stats, failures, stop, allowed_products):
-    page = await ctx.new_page()
-    try:
-        while True:
-            url, depth = await queue.get()
-            try:
-                if stop.is_set():
-                    continue
+async def _http_get(client, url: str, cfg: SimpleNamespace, headers: dict):
+    """GET with retries and backoff on network errors, 429, 403 and 5xx."""
+    last_exc = None
+    for attempt in range(cfg.retries):
+        try:
+            r = await client.get(url, headers=headers)
+            if r.status_code in (200, 304, 404, 410):
+                return r
+            last_exc = f"HTTP {r.status_code}"
+        except Exception as e:                       # httpx.TransportError etc.
+            last_exc = f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
+        await asyncio.sleep(2 * (attempt + 1))
+    print(f"      giving up on {url}: {last_exc}", file=sys.stderr)
+    return None
 
-                dest = url_to_path(url, out_dir)
-                cached = await _read_cached(dest, url, root, cfg)
-                if cached is not None:
-                    product_root, links = cached
-                    if _is_excluded(product_root, allowed_products):
-                        stats["skipped"] += 1
-                        print(f"[skip/product] d{depth}  {url}  ({product_root!r})")
-                        await _polite_wait(cfg)
-                        continue
-                    stats["reused"] += 1
-                    print(f"[reuse] d{depth}  {url}")
-                else:
-                    status, product_root, html, links = await _fetch_parse(
-                        page, url, root, cfg)
-                    if status not in USABLE_STATUSES:
-                        stats["failed"] += 1
-                        failures.append(url)
-                        print(f"  ! FAILED ({status}): {url}", file=sys.stderr)
-                        await _polite_wait(cfg)
-                        continue
-                    if _is_excluded(product_root, allowed_products):
-                        stats["skipped"] += 1
-                        print(f"[skip/product] d{depth}  {url}  ({product_root!r})")
-                        await _polite_wait(cfg)
-                        continue
-                    await _save_page(html, dest)
-                    stats["saved"] += 1
-                    if status == "thin":
-                        stats["thin"] += 1
-                    print(f"[{'save' if status == 'ok' else 'thin'}] d{depth}  {url}")
 
-                if cfg.max_pages and (stats["saved"] + stats["reused"]) >= cfg.max_pages:
-                    stop.set()
-                    continue
+async def _process(url: str, product: str, client, cfg, out_dir: Path, state: dict,
+                   sem: asyncio.Semaphore, stats: dict, changes: dict, failures: list,
+                   manifest: list):
+    async with sem:
+        dest = url_to_path(url, out_dir)
+        rel = dest.relative_to(out_dir).as_posix()
+        prev = state.get(url, {})
+        cached = dest.exists() and not cfg.force
 
-                if depth < cfg.depth:
-                    async with visited_lock:
-                        new_links = [l for l in links if l not in visited]
-                        visited.update(new_links)
-                    for link in new_links:
-                        queue.put_nowait((link, depth + 1))
+        headers = {}
+        if cached and prev.get("last_modified"):
+            headers["If-Modified-Since"] = prev["last_modified"]
 
-                await _polite_wait(cfg)
-            finally:
-                queue.task_done()
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await page.close()
+        r = await _http_get(client, url, cfg, headers)
+        await asyncio.sleep(cfg.wait)
+
+        if r is None or r.status_code in (404, 410):
+            stats["failed"] += 1
+            failures.append(url)
+            print(f"  ! FAILED ({'no response' if r is None else r.status_code}): {url}",
+                  file=sys.stderr)
+            if cached:                               # keep last good copy in the doc
+                manifest.append(rel)
+            return
+
+        if r.status_code == 304:
+            stats["not_modified"] += 1
+            manifest.append(rel)
+            print(f"[304]       {url}")
+            return
+
+        html = r.text
+        body_hash, title, topic_mod, crumb = await asyncio.to_thread(_topic_info, html)
+        if body_hash is None:
+            stats["failed"] += 1
+            failures.append(url)
+            print(f"  ! FAILED (no topic content): {url}", file=sys.stderr)
+            if cached:
+                manifest.append(rel)
+            return
+
+        old_hash = prev.get("hash")
+        if cached and old_hash is None:              # first run on this cache: hash the old copy
+            old_html = await asyncio.to_thread(
+                dest.read_text, encoding="utf-8", errors="replace")
+            old_hash = (await asyncio.to_thread(_topic_info, old_html))[0]
+
+        entry = {"file": rel, "title": title, "product": product, "breadcrumb_root": crumb,
+                 "topic_modified": topic_mod,
+                 "last_modified": r.headers.get("last-modified", ""),
+                 "hash": body_hash, "checked": time.strftime("%Y-%m-%d")}
+
+        if cached and old_hash == body_hash:
+            stats["unchanged"] += 1
+            print(f"[same]      {url}")
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(dest.write_text, html, encoding="utf-8")
+            kind = "updated" if cached else "new"
+            stats[kind] += 1
+            changes[kind].append(entry | {"url": url, "prev_modified": prev.get("topic_modified", "")})
+            print(f"[{kind:<9}] {url}")
+
+        state[url] = entry
+        manifest.append(rel)
+
+
+def _write_change_report(path: Path, changes: dict, removed: list[dict]) -> None:
+    date = time.strftime("%Y-%m-%d")
+    lines = [f"# Checkmarx docs changes — {date}\n",
+             f"New: {len(changes['new'])} · Updated: {len(changes['updated'])} · "
+             f"Removed from nav: {len(removed)}\n"]
+
+    def block(heading, rows, show_prev=False):
+        if not rows:
+            return
+        lines.append(f"## {heading}\n")
+        for e in sorted(rows, key=lambda e: (e.get("product", ""), e.get("title", ""))):
+            mod = e.get("topic_modified") or "?"
+            if show_prev and e.get("prev_modified"):
+                mod = f"{e['prev_modified']} → {mod}"
+            lines.append(f"- **{e.get('title') or e.get('file')}** ({e.get('product', '')}) "
+                         f"· {mod} · `{e.get('file')}`")
+        lines.append("")
+
+    block("New pages", changes["new"])
+    block("Updated pages", changes["updated"], show_prev=True)
+    block("Removed from nav (renamed or unpublished)", removed)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 async def _mirror(cfg: SimpleNamespace) -> None:
-    from playwright.async_api import async_playwright
+    import httpx
 
-    root = cfg.url
     out_dir = Path(cfg.html_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    fail_log = out_dir.parent / "failures.log"
-
-    allowed_products = {p.strip().lower() for p in cfg.include}
-
-    visited: set[str] = set()
-    visited_lock = asyncio.Lock()
-    queue: asyncio.Queue = asyncio.Queue()
-    stats = {"saved": 0, "reused": 0, "skipped": 0, "failed": 0, "thin": 0}
-    failures: list[str] = []
-    stop = asyncio.Event()
+    base = out_dir.parent
+    state_path, manifest_path = base / STATE_FILE, base / MANIFEST_FILE
+    fail_log = base / "failures.log"
+    state: dict = (json.loads(state_path.read_text(encoding="utf-8"))
+                   if state_path.exists() else {})
 
     start = time.time()
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        ctx = await browser.new_context(user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"))
+    limits = httpx.Limits(max_connections=cfg.concurrency)
+    async with httpx.AsyncClient(headers=HTTP_HEADERS, http2=False, limits=limits,
+                                 timeout=cfg.timeout / 1000, follow_redirects=True) as client:
+        r = await _http_get(client, cfg.url, cfg, {})
+        if r is None or r.status_code != 200:
+            sys.exit(f"[mirror] could not load start page {cfg.url} "
+                     f"({'no response' if r is None else r.status_code})")
+        urls, products_seen = _discover_from_nav(r.text, cfg)
+        if not urls:
+            sys.exit("[mirror] nav parse found no pages for INCLUDE_PRODUCTS. "
+                     f"Top-level products seen: {sorted(products_seen) or 'none'}")
 
-        # Discover seed URLs from the nav tree for the allowed product branches.
-        # Each seed is a root URL for one allowed product; crawl workers prune
-        # any pages that slip through with a mismatched breadcrumb.
-        seed_page = await ctx.new_page()
-        seeds = await _discover_seed_urls(seed_page, cfg, root)
-        await seed_page.close()
-        for seed in seeds:
-            if seed not in visited:
-                visited.add(seed)
-                queue.put_nowait((seed, 0))
+        per_product: dict[str, int] = {}
+        for p in urls.values():
+            per_product[p] = per_product.get(p, 0) + 1
+        print(f"[mirror] {len(urls)} live URLs from nav across {len(per_product)} products:")
+        for p, n in sorted(per_product.items(), key=lambda kv: -kv[1]):
+            print(f"         {n:>4}  {p}")
+        missing = {p for p in cfg.include} - set(per_product)
+        if missing:
+            print(f"[mirror] WARNING: no nav entries for {sorted(missing)}", file=sys.stderr)
 
-        workers = [asyncio.create_task(
-            _worker(ctx, queue, visited, visited_lock, cfg, root, out_dir,
-                    stats, failures, stop, allowed_products))
-            for _ in range(cfg.concurrency)]
-        await queue.join()
-        for w in workers:
-            w.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
-        await browser.close()
+        items = list(urls.items())
+        if cfg.max_pages:
+            items = items[:cfg.max_pages]
 
+        stats = {"new": 0, "updated": 0, "unchanged": 0, "not_modified": 0, "failed": 0}
+        changes = {"new": [], "updated": []}
+        failures: list[str] = []
+        manifest: list[str] = []
+        sem = asyncio.Semaphore(cfg.concurrency)
+        await asyncio.gather(*[
+            _process(u, p, client, cfg, out_dir, state, sem, stats, changes, failures, manifest)
+            for u, p in items])
+
+    # Pages we tracked before that are no longer in the nav (skip when --max-pages
+    # truncated the run, since then absence proves nothing).
+    removed = []
+    if not cfg.max_pages:
+        live = set(urls)
+        for u in [u for u in state if u not in live]:
+            removed.append(state.pop(u) | {"url": u})
+
+    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    manifest_path.write_text(json.dumps(sorted(set(manifest)), indent=2), encoding="utf-8")
+    report = base / f"changes-{time.strftime('%Y-%m-%d')}.md"
+    _write_change_report(report, changes, removed)
     if failures:
         fail_log.write_text("\n".join(failures) + "\n", encoding="utf-8")
+
+    stale = [p for p in out_dir.rglob("*.html")
+             if p.relative_to(out_dir).as_posix() not in set(manifest)]
     dt = time.time() - start
-    print(f"\n[mirror] done in {dt/60:.1f} min — "
-          f"saved {stats['saved']} (thin {stats['thin']}), "
-          f"reused {stats['reused']}, skipped {stats['skipped']}, "
-          f"failed {stats['failed']}")
-    if failures:
-        print(f"[mirror] {len(failures)} failures logged to {fail_log}; "
-              f"re-run --stage mirror to retry just those.")
+    print(f"\n[mirror] done in {dt/60:.1f} min — new {stats['new']}, updated {stats['updated']}, "
+          f"unchanged {stats['unchanged'] + stats['not_modified']} "
+          f"(304: {stats['not_modified']}), failed {stats['failed']}")
+    print(f"[mirror] removed from nav since last run: {len(removed)}; "
+          f"stale cached files ignored by extract: {len(stale)}")
+    print(f"[mirror] wrote {manifest_path.name}, {state_path.name}, {report.name}")
+    if stats["new"] + stats["updated"] == 0:
+        print("[mirror] no content changes detected this run.")
 
 
 # ===========================================================================
@@ -644,7 +661,19 @@ def _build_records(index: dict[str, dict]) -> tuple[list[dict], int]:
 
 def stage_extract(cfg: SimpleNamespace) -> None:
     html_dir = Path(cfg.html_dir)
-    files = sorted(html_dir.rglob("*.html"))
+    manifest_path = html_dir.parent / MANIFEST_FILE
+    if manifest_path.exists():
+        # Only pages that were live in the nav on the last mirror run. Cached
+        # files from renamed or unpublished slugs are left on disk but ignored.
+        listed = json.loads(manifest_path.read_text(encoding="utf-8"))
+        files = sorted(p for p in (html_dir / rel for rel in listed) if p.exists())
+        stale = sum(1 for p in html_dir.rglob("*.html")) - len(files)
+        print(f"[extract] using {MANIFEST_FILE}: {len(files)} live pages"
+              f"{f', {stale} stale cached files ignored' if stale > 0 else ''}")
+    else:
+        files = sorted(html_dir.rglob("*.html"))
+        print(f"[extract] WARNING: no {MANIFEST_FILE}; reading every cached page, "
+              f"including any stale slugs. Run the mirror stage first.", file=sys.stderr)
     if not files:
         print(f"[extract] no .html under {html_dir} — run the mirror stage first.",
               file=sys.stderr)
@@ -710,6 +739,20 @@ def _page_lines(rec: dict) -> list[str]:
     ]
 
 
+def _newest_modified(records: list[dict]) -> str:
+    """Latest per-topic data-time-modified across the kept pages, e.g.
+    'September 17, 2026'. This is the honest freshness signal: the Captured
+    date is only when the pipeline ran."""
+    best = None
+    for r in records:
+        try:
+            d = datetime.strptime(r.get("modified", "").strip(), "%B %d, %Y")
+        except ValueError:
+            continue
+        best = d if best is None or d > best else best
+    return f"{best:%B} {best.day}, {best.year}" if best else ""
+
+
 def stage_combine(cfg: SimpleNamespace) -> None:
     records = json.loads(Path(cfg.json_path).read_text(encoding="utf-8"))
     kept = [r for r in records if r["status"] == "keep" and r.get("markdown")]
@@ -729,7 +772,8 @@ def stage_combine(cfg: SimpleNamespace) -> None:
         f"(include-only: {', '.join(cfg.include)})"
     lines = []
     lines.append(f"# {cfg.doc_title}\n")
-    lines.append(f"**Captured:** {date}\n")
+    lines.append(f"**Captured:** {date}  ")
+    lines.append(f"**Content current through:** {_newest_modified(kept) or 'unknown'}\n")
     lines.append(f"_Source: {cfg.url}_\n")
     lines.append(f"_Pages: {len(kept)} kept across {len(ordered)} products; "
                  f"{len(rescued)} referenced. Excluded: {excluded}._\n")
