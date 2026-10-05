@@ -339,6 +339,46 @@ class Repairs(unittest.TestCase):
         self.assertGreaterEqual(len(log), 5)
 
 
+class Validation(unittest.TestCase):
+    def doc(self):
+        return build([src("live", "SCANS", live_doc())], [src("stoplight", "s1", sl_doc())])["doc"]
+
+    def test_validator_runs_by_default(self):
+        out = A.validate_openapi(self.doc())
+        self.assertEqual(out["validator"], "ok")
+        self.assertIn("passes the OpenAPI 3.0 validator", out["summary"])
+
+    def test_validator_reports_errors(self):
+        doc = self.doc()
+        doc["paths"]["/api/scans"]["get"]["responses"] = "nope"
+        out = A.validate_openapi(doc)
+        self.assertEqual(out["validator"], "errors")
+        self.assertGreaterEqual(out["validator_error_count"], 1)
+
+    def test_skip_flag(self):
+        out = A.validate_openapi(self.doc(), skip=True)
+        self.assertEqual(out["validator"], "skipped")
+        self.assertIn("--skip-validation", out["summary"])
+
+    def test_cli_flag_and_default(self):
+        import argparse
+        ap = argparse.ArgumentParser()
+        A.add_arguments(ap)
+        self.assertFalse(A.build_cfg(ap.parse_args([])).skip_validation)
+        self.assertTrue(A.build_cfg(ap.parse_args(["--skip-validation"])).skip_validation)
+
+    def test_missing_validator_stops_the_run_before_fetching(self):
+        import argparse
+        from unittest import mock
+        ap = argparse.ArgumentParser()
+        A.add_arguments(ap)
+        cfg = A.build_cfg(ap.parse_args([]))
+        with mock.patch.object(A, "_load_validator", side_effect=A.FatalError("missing")), \
+                mock.patch.object(A, "fetch_all") as fetch:
+            self.assertEqual(A.run(cfg), A.EXIT_FATAL)
+            fetch.assert_not_called()
+
+
 class LoadUsed(unittest.TestCase):
     def test_formats(self):
         txt = temp_file("# c\nGET /api/a/{x}\n/api/b\n", ".txt")

@@ -17,8 +17,6 @@ Python 3.9+.
 python -m pip install -r requirements.txt
 ```
 
-Optional: uncomment `openapi-spec-validator` in `requirements.txt` to have the API stage validate its output.
-
 ## Usage
 
 ```bash
@@ -55,6 +53,7 @@ Useful flags:
 - `--dry-run` fetch and write only the report.
 - `--from-raw DIR` rebuild offline from earlier downloads.
 - `--probe` confirm gateway prefixes with a few unauthenticated GETs.
+- `--skip-validation` skip the OpenAPI 3.0 validator, which otherwise runs on every merge.
 
 No credentials are used. Services that need a login (`ai-triage`, `remediation` openapi.json) are reported and skipped.
 

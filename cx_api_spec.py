@@ -1768,20 +1768,34 @@ def write_report(path: Path, drift: dict, manifest: dict, run_date: str,
     path.write_text("\n".join(L), encoding="utf-8", newline="\n")
 
 
-def validate_openapi(doc: dict) -> dict:
-    out = {"dangling_refs": dangling_refs(doc)}
+def _load_validator():
     try:
         from openapi_spec_validator import OpenAPIV30SpecValidator
-        errs = [e.message[:200] for e in OpenAPIV30SpecValidator(doc).iter_errors()]
+    except ImportError:
+        raise FatalError("openapi-spec-validator is required to validate the output: "
+                         "python -m pip install -r requirements.txt  (or pass --skip-validation)") from None
+    return OpenAPIV30SpecValidator
+
+
+def validate_openapi(doc: dict, skip: bool = False) -> dict:
+    """Dangling-$ref check plus the OpenAPI 3.0 validator (skipped with --skip-validation)."""
+    out = {"dangling_refs": dangling_refs(doc)}
+    if skip:
+        out["validator"] = "skipped"
+    else:
+        validator = _load_validator()
+        try:
+            errs = [e.message[:200] for e in validator(doc).iter_errors()]
+        except Exception as e:   # the validator raises, rather than yields, on badly malformed input
+            errs = [f"validator could not finish: {type(e).__name__}: {str(e)[:150]}"]
         out["validator_errors"] = errs[:20]
         out["validator_error_count"] = len(errs)
         out["validator"] = "ok" if not errs else "errors"
-    except ImportError:
-        out["validator"] = "not installed (pip install openapi-spec-validator)"
     refs = "0 dangling $refs" if not out["dangling_refs"] else f"{len(out['dangling_refs'])} DANGLING $refs"
     verdict = {"ok": "passes the OpenAPI 3.0 validator.",
-               "errors": f"{out.get('validator_error_count')} OpenAPI validator errors (see manifest)."}
-    out["summary"] = f"{refs}; " + verdict.get(out["validator"], f"validator {out['validator']}.")
+               "errors": f"{out.get('validator_error_count')} OpenAPI validator errors (see manifest).",
+               "skipped": "OpenAPI validator skipped (--skip-validation)."}
+    out["summary"] = f"{refs}; " + verdict[out["validator"]]
     return out
 
 
@@ -1852,6 +1866,8 @@ def run(cfg) -> int:
 
 
 def _run(cfg) -> int:
+    if not cfg.skip_validation:
+        _load_validator()          # fail before fetching anything if it is missing
     out = abs_path(cfg.out_dir)
     raw_dir = out / "raw"
     notes: list[str] = []
@@ -1892,7 +1908,7 @@ def _run(cfg) -> int:
         "Schemas, parameters, enums and required-ness come from live; prose and examples from Stoplight.")
     new_hist = update_history(history, res["live_sigs"], run_date)
     drift = compute_drift(res, baseline, new_hist, load_used(cfg.used_endpoints))
-    validation = validate_openapi(res["doc"])
+    validation = validate_openapi(res["doc"], cfg.skip_validation)
     manifest = build_manifest(res, raw, drift, validation, cfg, run_date, lives, extras, sls)
     drift = {"run_date": run_date, "baseline": cfg.baseline, **drift}
 
@@ -1928,6 +1944,8 @@ def add_arguments(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--probe", action="store_true",
                    help="Confirm declared prefixes with a few unauthenticated GETs (off by default)")
     g.add_argument("--run-date", help="Pin the sync date (YYYY-MM-DD), e.g. to reproduce a run")
+    g.add_argument("--skip-validation", action="store_true",
+                   help="Do not run the OpenAPI 3.0 validator on the merged spec (it runs by default)")
 
 
 def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
@@ -1944,6 +1962,7 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
         used_endpoints=getattr(args, "used_endpoints", None),
         dry_run=getattr(args, "dry_run", False), from_raw=getattr(args, "from_raw", None),
         probe=getattr(args, "probe", False), run_date=getattr(args, "run_date", None),
+        skip_validation=getattr(args, "skip_validation", False),
         concurrency=API_CONCURRENCY, timeout=API_TIMEOUT, retries=API_RETRIES,
         allowed_hosts={(urlparse(base).hostname or "").lower(), "stoplight.io", "checkmarx.stoplight.io"})
 
