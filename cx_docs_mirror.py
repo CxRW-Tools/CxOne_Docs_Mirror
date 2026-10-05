@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-cx_docs_mirror.py — End-to-end Checkmarx docs pipeline in four stages:
+cx_docs_mirror.py — Checkmarx documentation downloader. Two independent jobs
+that write to separate outputs:
 
+  USER DOCS  (docs.checkmarx.com -> one Markdown file, in four stages)
     1. MIRROR    Read the live nav, fetch allowed pages over plain HTTP, and
                  write only pages whose topic content changed. Produces a
                  manifest, a state file, and a changes-<date>.md report.
@@ -12,23 +14,31 @@ cx_docs_mirror.py — End-to-end Checkmarx docs pipeline in four stages:
     4. COMPRESS  Post-process an existing canonical .md, dropping version /
                  changelog pages and duplicates. Not part of the default run.
 
-Run the first three stages (default) or any one in isolation:
+  API SPEC   (live tenant catalog + Stoplight -> one OpenAPI 3.0.3 candidate)
+    api-spec     Fetch both sources, merge them, and report drift against a
+                 baseline spec. Everything lands in ./api-spec/ and never mixes
+                 with the user-docs files. See cx_api_spec.py for the details.
 
-    python cx_docs_mirror.py                 # mirror -> extract -> combine
+Run everything (default), or any part in isolation:
+
+    python cx_docs_mirror.py                 # docs stages + api-spec
+    python cx_docs_mirror.py --stage docs    # mirror -> extract -> combine only
     python cx_docs_mirror.py --stage mirror
     python cx_docs_mirror.py --stage extract
     python cx_docs_mirror.py --stage combine
     python cx_docs_mirror.py --stage compress
+    python cx_docs_mirror.py --stage api-spec --baseline path/to/cxone_openapi.json
 
 All knobs live in the CONFIG block below (target URL, what to include/exclude,
 crawl tuning, output paths, product ordering). Anything there can also be
-overridden on the command line — see `--help`.
+overridden on the command line — see `--help`. The api-spec stage has its own
+defaults at the top of cx_api_spec.py.
 
 ------------------------------------------------------------------------------
 SETUP (Python 3.9+):
     python -m pip install -r requirements.txt
-    (needs: httpx, beautifulsoup4, lxml, markdownify. Playwright is no longer
-    used; the docs site serves topic content as static HTML.)
+    (needs: httpx, beautifulsoup4, lxml, markdownify, PyYAML. Playwright is no
+    longer used; the docs site serves topic content as static HTML.)
 
 Use --force to refetch and rewrite every page regardless of cache.
 ------------------------------------------------------------------------------
@@ -969,9 +979,12 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Checkmarx docs pipeline: mirror -> extract -> combine.")
-    ap.add_argument("--stage", choices=["mirror", "extract", "combine", "compress", "all"],
-                    default="all", help="Which stage to run (default: all)")
+        description="Checkmarx docs downloader: user docs (mirror -> extract -> combine) "
+                    "and the Checkmarx One API spec (api-spec).")
+    ap.add_argument("--stage", choices=["mirror", "extract", "combine", "compress", "docs", "api-spec", "all"],
+                    default="all",
+                    help="Which stage to run. docs = mirror+extract+combine; "
+                         "all (default) = docs + api-spec")
     # overrides (all default None => fall back to CONFIG)
     ap.add_argument("--url")
     ap.add_argument("--include", nargs="*", help="Keep ONLY these product roots")
@@ -991,17 +1004,23 @@ def main() -> None:
     ap.add_argument("--md-out", help="Output path for the compress stage (default: overwrite --md-path)")
     ap.add_argument("--title-exclude", nargs="*", help="Regexes; drop pages whose title matches")
     ap.add_argument("--doc-title")
+    import cx_api_spec          # no third-party imports at module load, so docs-only runs stay light
+    cx_api_spec.add_arguments(ap)
     args = ap.parse_args()
-    cfg = build_cfg(args)
 
-    if args.stage in ("mirror", "all"):
-        stage_mirror(cfg)
-    if args.stage in ("extract", "all"):
-        stage_extract(cfg)
-    if args.stage in ("combine", "all"):
-        stage_combine(cfg)
-    if args.stage == "compress":
-        stage_compress(cfg)
+    run_docs = args.stage in ("docs", "all")
+    if run_docs or args.stage in ("mirror", "extract", "combine", "compress"):
+        cfg = build_cfg(args)
+        if args.stage == "mirror" or run_docs:
+            stage_mirror(cfg)
+        if args.stage == "extract" or run_docs:
+            stage_extract(cfg)
+        if args.stage == "combine" or run_docs:
+            stage_combine(cfg)
+        if args.stage == "compress":
+            stage_compress(cfg)
+    if args.stage in ("api-spec", "all"):
+        sys.exit(cx_api_spec.run(cx_api_spec.build_cfg(args)))
 
 
 if __name__ == "__main__":

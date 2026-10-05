@@ -17,4 +17,9 @@
 beautifulsoup4>=4.12,<5     # HTML parsing / nav, breadcrumb + content extraction
 lxml>=5.0,<7                # parser backend used by BeautifulSoup("lxml")
 markdownify>=0.13,<2        # HTML -> Markdown conversion
-httpx>=0.25,<1              # async HTTP client (mirror stage)
+httpx>=0.25,<1              # async HTTP client (mirror + api-spec stages)
+PyYAML>=6.0,<7              # parses the per-service OpenAPI YAML (api-spec stage)
+#
+# Optional: lets the api-spec stage run the OpenAPI 3.0 validator on its output
+# and report the result. Skipped (with a note) when not installed.
+#openapi-spec-validator>=0.7,<1
