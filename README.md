@@ -40,8 +40,9 @@ Useful flags:
 | `--from-raw DIR` | API: rebuild offline from earlier downloads |
 | `--probe` | API: confirm gateway prefixes with a few unauthenticated GETs |
 | `--skip-validation` | API: skip the OpenAPI 3.0 validator (it runs by default) |
+| `--auth-token-env VAR` | API: opt in to authenticated fetching of the extra services (see below); `VAR` names an environment variable holding a tenant bearer token |
 
-No credentials are used. API services that need a login (`ai-triage` and `remediation` `openapi.json`) are reported and skipped.
+No credentials are used by default. The `ai-triage` and `remediation` `openapi.json` files need a login, so they are reported and skipped unless you opt in with `--auth-token-env`.
 
 ## Output files
 
@@ -89,9 +90,56 @@ api/                                    API spec (generated, gitignored except o
 | `raw/provenance.json` | api-spec | Source URL, fetch time, SHA-256 and status for every raw file | Traceability | Rewritten each fetch |
 | `raw/live/` | api-spec | `swagger-starter.js`, `catalog.json` (service list), one `<SERVICE>.yaml` per live service, `extra-*.json` for extra services | The live source files, as downloaded | Cache; a failed fetch keeps the previous copy |
 | `raw/stoplight/` | api-spec | `branches.json`, `toc.json`, `services.json`, one OpenAPI YAML per Stoplight API | The Stoplight source files, as downloaded | Same as above |
-| `overlay/*.yaml` or `*.json` | you | Operations (same shape as the spec) that neither source has; applied after the merge and flagged when a source starts covering them | Keep hand-added endpoints across runs | Input; tracked in git |
+| `overlay/*.yaml` or `*.json` | you | Operations (same shape as the spec) that neither source has; applied after the merge and flagged when a source starts covering them, unless the operation sets `x-overlay-keep: true` | Keep hand-added endpoints across runs | Input; tracked in git |
 
 Rebuild without the network using `--from-raw api/raw`. A run with `--dry-run` fetches but writes only the report.
+
+## How the API spec is built
+
+### Where each service is placed
+
+The live YAML's own `servers[0].url` is the authority for a service's gateway prefix. The baseline spec is **never** used as evidence, so the same raw files give a byte-identical `cxone_openapi.json` with or without `--baseline`; the baseline only affects the drift report.
+
+| `x-prefix-confidence` | Meaning |
+|---|---|
+| `matched` | The live prefix and a Stoplight service agree (several non-trivial operations match) |
+| `declared` | Only the live `servers[0].url` says so |
+| `probed` | `declared`, and `--probe` saw the route exist (401/403/405) |
+| `conflict` | Stoplight matches several operations at a *different* prefix. Operations are placed at the live prefix and listed under "Prefix problems" in the report and `prefix_conflict` in the drift file. A human decides |
+| `overlay` | Comes from the overlay |
+| unknown | No usable prefix (for example `INTEGRATIONS_REPOS`, whose `servers[0].url` is `REPOS`); operations are left unplaced and listed in the manifest |
+
+A Stoplight match only counts when at least two operations match, and a bare `/` or `/{id}` never counts (nearly every service has one).
+
+### Drift severity
+
+Each changed operation is `breaking` or `additive`. `--used-endpoints` exits with code 10 only for **breaking** drift on an endpoint you listed (a removed or missing operation, or a breaking change). Additive drift on your endpoints is listed in the report but does not fail the run.
+
+Breaking: a removed parameter (except an optional header), a parameter or request field that became required, an enum value removed from an input, a type change, a removed field in a 2xx response or in a request, a 2xx response field that is no longer guaranteed, a changed authentication requirement, or a missing operation. Everything else, including new optional parameters, new fields, new enum values, constraint tweaks and changes to error bodies, is additive.
+
+### Overlay and the AI services
+
+`api/overlay/from-baseline.json` holds operations that no source provides. `api/overlay/ai-services-authenticated.json` holds the live `ai-triage` and `remediation` operations that the unauthenticated sources lack: `POST /api/ai-triage/v2/triage`, `POST /api/remediation/v2/remediate`, `GET /api/remediation/remediation/{remediation_id}/export`, and the full live `POST /api/remediation/remediate` (Stoplight has that one but omits `projectID`, so it carries `x-overlay-keep: true` and is never reported as retirable).
+
+To regenerate the AI file, fetch both specs with a tenant token, then inline every `$ref` so the file is self-contained:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" "$BASE_URL/api/ai-triage/openapi.json"
+curl -H "Authorization: Bearer $TOKEN" "$BASE_URL/api/remediation/openapi.json"
+```
+
+Or let the tool fetch them: set a token in an environment variable and pass its name.
+
+```bash
+export CX_TOKEN=...           # tenant bearer token; never put it in a file
+python cx_docs_mirror.py --stage api-spec --auth-token-env CX_TOKEN
+```
+
+The token is read from the environment, sent only to the `--api-base-url` host for those two requests (never to Stoplight, never followed across redirects), and is not written to disk or printed. Use a token for the same tenant as `--api-base-url`. The downloaded specs land in `api/raw/live/extra-*.json` and are merged as live sources, after which the overlay entries become redundant (the report says so). **No credentials may be committed to this repository.**
+
+### Resetting `history.json`
+
+`history.json` records per-operation signatures, so a change to placement logic can leave spurious `removed_candidate` entries behind. Its format carries a version; a file written by an older version is ignored automatically (the run notes it) and a fresh history starts. To reset by hand, delete `api/history.json`.
 
 ## Cleanup and safety
 
@@ -99,6 +147,10 @@ Rebuild without the network using `--from-raw api/raw`. A run with `--dry-run` f
 - The extract JSON is the only intermediate and is removed once combine succeeds.
 - Everything else in `docs/` and `api/` is a deliverable, state or cache, as listed above.
 - `docs/` and `api/` (except `api/overlay/`) are gitignored; only the tool is committed.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
 
 ## Tests
 
