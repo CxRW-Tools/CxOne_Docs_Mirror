@@ -1,0 +1,777 @@
+{
+  "info": {
+    "title": "overlay",
+    "version": "1"
+  },
+  "openapi": "3.0.3",
+  "paths": {
+    "/accounts/{id}/logs": {
+      "get": {
+        "description": "Get logs associated with a Cloud Insight Enrichment account.",
+        "operationId": "8tjgxjgrulnit_retrieve_account_logs",
+        "parameters": [
+          {
+            "description": "Cloud Insights Account ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid4",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by the type of the event",
+            "in": "query",
+            "name": "eventType",
+            "required": false,
+            "schema": {
+              "description": "The type of the event",
+              "enum": [
+                "Incoming",
+                "Outgoing"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by the status of the process",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "description": "The status of the process",
+              "enum": [
+                "Success",
+                "Failed"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by whether the event was a scheduled sync (`Scheduled`) or a manual sync (`Sync`)",
+            "in": "query",
+            "name": "description",
+            "required": false,
+            "schema": {
+              "description": "Whether the event was scheduled or manual sync",
+              "enum": [
+                "Sync",
+                "Scheduled"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by start of the creation date range . ISO 8601 format.",
+            "in": "query",
+            "name": "createdAtStart",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by the end of the creation date range. ISO 8601 format.",
+            "in": "query",
+            "name": "createdAtEnd",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by unique sync Id. Submit this Id to check on the status of an initiated Cloud Insights Enrichment process. <br>This ID is returned via [`POST /v2/accounts/{id}/enrich`](cloud%20insights.yaml/paths/~1v2~1accounts~1{id}~1enrich/post)",
+            "in": "query",
+            "name": "syncId",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json; version=1.0": {
+                "schema": {
+                  "properties": {
+                    "currentPage": {
+                      "description": "currentPage",
+                      "type": "integer"
+                    },
+                    "data": {
+                      "description": "list of account logs",
+                      "items": {
+                        "$ref": "#/__bundled__/AccountLog"
+                      },
+                      "type": "array"
+                    },
+                    "lastPage": {
+                      "description": "currentPage",
+                      "type": "integer"
+                    },
+                    "total": {
+                      "description": "total",
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Ok"
+          },
+          "400": {
+            "content": {
+              "application/json; version=1.0": {
+                "schema": {
+                  "properties": {
+                    "code": {
+                      "type": "integer"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "description": "Unauthorized, Access token is missing or invalid"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        },
+        "summary": "Retrieve account logs",
+        "tags": [
+          {
+            "id": "0d9ccc361a1ca",
+            "name": "Accounts"
+          }
+        ]
+      }
+    },
+    "/accounts/{id}/resources": {
+      "get": {
+        "description": "Get a list of resources identified in a particular Cloud Insights Enrichment account together with the Checkmarx One project associated with each resource. You can limit the results by using pagination and/or setting filters.\r\n\r\n> This API is intended to replace [`GET /accounts/{id}/containers`](cloud%20insights.yaml/paths/~1accounts~1{id}~1containers/get) which will soon be deprecated.",
+        "operationId": "ma3kbuchb9si8_retrieve_list_of_resources",
+        "parameters": [
+          {
+            "description": "Cloud Insights Account ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid4",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by image name",
+            "in": "query",
+            "name": "image-name",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by the short name of the image",
+            "in": "query",
+            "name": "image-short-name",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by the publicly exposed parameter",
+            "in": "query",
+            "name": "public-exposed",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by search text",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by the names of the clusters (comma-separated)",
+            "in": "query",
+            "name": "cluster-name",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Filter by type of asset (comma-separated)",
+            "in": "query",
+            "name": "asset-type",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/__bundled__/AssetType"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Filter by the resource type",
+            "in": "query",
+            "name": "resource-type",
+            "required": false,
+            "schema": {
+              "description": "The resource type",
+              "enum": [
+                "CONTAINER"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The number of results to skip before starting to return results",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The maximum number of results to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order-column",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order-direction",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json; version=1.0": {
+                "schema": {
+                  "properties": {
+                    "currentPage": {
+                      "description": "The number of the current page of results",
+                      "type": "integer"
+                    },
+                    "data": {
+                      "items": {
+                        "$ref": "#/__bundled__/Resource"
+                      },
+                      "type": "array"
+                    },
+                    "lastPage": {
+                      "description": "The page number of the last page, based on current filters and pagination",
+                      "type": "integer"
+                    },
+                    "total": {
+                      "description": "Total number of results",
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Ok"
+          },
+          "400": {
+            "content": {
+              "application/json; version=1.0": {
+                "schema": {
+                  "properties": {
+                    "code": {
+                      "type": "integer"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "description": "Unauthorized, Access token is missing or invalid"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        },
+        "summary": "Retrieve list of resources",
+        "tags": [
+          {
+            "id": "aa42784ddeb87",
+            "name": "Resources"
+          }
+        ]
+      }
+    },
+    "/api/credits/consumption": {
+      "get": {
+        "description": "Paginated per-user consumption: {items:[{name, email, userEmail, creditsUsed, percentOfTotal, actionsPerformed:{actions:[{actionType, transactionCount}], total}}], totalItems, totalPages, currentPage}.\n\n`percentOfTotal` is a share of credits USED, not of the entitlement \u2014 it cannot be used to infer the pool (read /api/credits/info for that). Paging is `page` (1-based). Observed actionTypes: `triage`, `remediation`. Summing them gives the per-action credit cost: live, creditsUsed == 1*triage + 3*remediation held for all 38 users.",
+        "parameters": [
+          {
+            "description": "1-based page index",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-user consumption page"
+          }
+        },
+        "summary": "AI credit consumption per user (Checkmarx Assist)",
+        "x-live-verified": "2026-07-31",
+        "x-source": "live tenant probe (undocumented: absent from the Stoplight export AND from {base_url}/spec/v1)"
+      }
+    },
+    "/api/credits/info": {
+      "get": {
+        "description": "Tenant-wide AI consumption credits. Response: {available, total, used, actionsAvailable, actionsPerformed, enforcement:{state, consumptionPct, warningThresholdPct, cutoffThresholdPct}}.\n\nNOTE: `actionsAvailable` is the platform's own estimate and does NOT match the observed per-action costs \u2014 live it equalled available/5, implying a blended ~5 credits/action, while measured costs are triage=1 and remediation=3. Prefer computing cost from the action type.",
+        "responses": {
+          "200": {
+            "description": "Credit balance and enforcement thresholds"
+          }
+        },
+        "summary": "AI credit balance (Checkmarx Assist)",
+        "x-live-verified": "2026-07-31",
+        "x-source": "live tenant probe (undocumented: absent from the Stoplight export AND from {base_url}/spec/v1)"
+      }
+    },
+    "/api/remediation/remediation-details/{scan_id}": {
+      "get": {
+        "description": "Bulk variant for one scan; `result_ids` is a required repeated query parameter. LIVE-ONLY: absent from the published Stoplight YAML.",
+        "parameters": [
+          {
+            "description": "JWT access token",
+            "in": "header",
+            "name": "Authorization",
+            "required": true,
+            "schema": {
+              "format": "JWT",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Specify the accepted media types. API version should be appended to this header. Currently, only v1.0 is supported.",
+            "in": "header",
+            "name": "Accept",
+            "required": true,
+            "schema": {
+              "examples": [
+                "*/*; version=1.0"
+              ],
+              "pattern": ".*version\\s*=\\s*([\\d|.]+)",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "scan_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repeated alternateId values",
+            "in": "query",
+            "name": "result_ids",
+            "required": true,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "RemediationDetailsResponse"
+          },
+          "401": {
+            "description": "Authentication failed"
+          },
+          "402": {
+            "description": "Insufficient AI consumption credits"
+          },
+          "403": {
+            "description": "Feature not enabled or insufficient roles"
+          },
+          "404": {
+            "description": "Remediation not found"
+          },
+          "422": {
+            "description": "Validation error"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Retrieve AI Remediation Assist details (bulk)",
+        "x-live-verified": "2026-07-31",
+        "x-source": "live tenant openapi.json + Stoplight AI-Triage.yaml/AI-Remediation.yaml"
+      }
+    },
+    "/api/repos-manager/scms/{scmId}/orgs/{orgIdentity}/repo/projectScan": {
+      "post": {
+        "description": "Triggers a scan for a repository already imported via the SCM integration. Live-validated in the Checkmarx One Multi-Tool; present in the platform but omitted from the published OpenAPI export. Re-confirm against Stoplight (repos-manager) when the official spec is updated.",
+        "operationId": "multitool_added_projectScan",
+        "parameters": [
+          {
+            "description": "SCM integration id",
+            "in": "path",
+            "name": "scmId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Org/group identity that owns the repo",
+            "in": "path",
+            "name": "orgIdentity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target CxOne project id",
+            "in": "query",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "branch": {
+                    "description": "Branch to scan",
+                    "type": "string"
+                  },
+                  "scmRepository": {
+                    "description": "Repo descriptor (e.g. {id} or {url}); shape mirrors scm-projects import.",
+                    "type": "object"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Scan triggered"
+          },
+          "201": {
+            "description": "Scan created"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "404": {
+            "description": "SCM/org/project not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Trigger a scan on an SCM-onboarded project",
+        "x-source": "added-by-multitool: live-validated, absent from upstream export"
+      }
+    },
+    "/auth/realms/{tenant_account_name}/protocol/openid-connect/token": {
+      "post": {
+        "description": "Generates a JWT access token used to authenticate all Checkmarx One API requests.\n\n## Authentication Flows\n\nSelect one of the following flows to obtain an access token::\n\n-   **API Key / Refresh Token** \n    <br> Uses `grant_type`=`refresh_token`\n\n-   **OAuth2 Client Credentials**\n    <br> Uses `grant_type`=`client_credentials`\n\n## Token Usage\n\n- Include the access token in all API requests using the Authorization header:\n  `Authorization: Bearer <access_token>`\n- You can reuse the access token until it expires (**expires in 30 Minutes**)\n- When your access token expires, you can generate a new one using the **refresh_token** returned in the response (**valid for 8 hours**)",
+        "operationId": "y98qeim2hjgb0_generate_access_token",
+        "parameters": [
+          {
+            "description": "Your Checkmarx tenant account name.",
+            "in": "path",
+            "name": "tenant_account_name",
+            "required": true,
+            "schema": {
+              "examples": [
+                "my-tenant"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "examples": {
+                "client_credentials": {
+                  "value": {
+                    "client_id": "your-iam-oauth-client",
+                    "client_secret": "your-secret-key",
+                    "grant_type": "client_credentials"
+                  }
+                },
+                "refresh_token": {
+                  "value": {
+                    "client_id": "ast-app",
+                    "grant_type": "refresh_token",
+                    "refresh_token": "your-api-key-or-refresh-token"
+                  }
+                }
+              },
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/__bundled__/ApiKeyOrRefreshTokenRequest"
+                  },
+                  {
+                    "$ref": "#/__bundled__/ClientCredentialsRequest"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "default": {
+                    "value": {
+                      "access_token": "eyJhbGciOiJSUzI1NiIsInR...phQlk0nAGjOtvG8UT-8iaA",
+                      "expires_in": 1800,
+                      "not-before-policy": 0,
+                      "refresh_expires_in": 28800,
+                      "refresh_token": "eyJhbGciOiJIUzI1Ni...Pf43RbBz4M",
+                      "scope": "iam-api profile email ast-api groups offline_access roles",
+                      "session_state": "f4308084-84b5-41af-a326-7c38d9fc19fa",
+                      "token_type": "bearer"
+                    }
+                  }
+                },
+                "schema": {
+                  "properties": {
+                    "access_token": {
+                      "description": "Access token used for authentication with Checkmarx One API calls.",
+                      "type": "string"
+                    },
+                    "expires_in": {
+                      "description": "Time left until the access token expires, in seconds.",
+                      "examples": [
+                        1800
+                      ],
+                      "format": "int32",
+                      "maximum": 2147483647,
+                      "minimum": -2147483648,
+                      "type": "integer"
+                    },
+                    "not-before-policy": {
+                      "description": "Time delay until the access token is first activated, in seconds. A value of 0 means the token is valid immediately.\n",
+                      "examples": [
+                        0
+                      ],
+                      "format": "int32",
+                      "maximum": 2147483647,
+                      "minimum": -2147483648,
+                      "type": "integer"
+                    },
+                    "refresh_expires_in": {
+                      "description": "Time period for which the refresh token is valid, in seconds.",
+                      "format": "int32",
+                      "maximum": 2147483647,
+                      "minimum": -2147483648,
+                      "type": "integer"
+                    },
+                    "refresh_token": {
+                      "description": "New refresh token that can be used to generate new access tokens.",
+                      "type": "string"
+                    },
+                    "scope": {
+                      "description": "Permissions associated with the access token.",
+                      "type": "string"
+                    },
+                    "session_state": {
+                      "description": "Unique ID representing the session.",
+                      "type": "string"
+                    },
+                    "token_type": {
+                      "description": "Token type.",
+                      "examples": [
+                        "bearer"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Returns an access token for authenticating API requests, along with a refresh token and expiration details.\r\n"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "invalid_grant_type": {
+                    "value": {
+                      "message": "Grant type must be one of the following value - client_credentials"
+                    }
+                  },
+                  "missing_token": {
+                    "value": {
+                      "message": "Token is a required field"
+                    }
+                  }
+                },
+                "schema": {
+                  "properties": {
+                    "message": {
+                      "description": "Error message.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "default": {
+                    "value": {
+                      "message": "Not Authorized - Provided token is not valid"
+                    }
+                  }
+                },
+                "schema": {
+                  "properties": {
+                    "message": {
+                      "description": "Error message.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Not Authorized"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "default": {
+                    "value": {
+                      "message": "Method Not Allowed"
+                    }
+                  }
+                },
+                "schema": {
+                  "properties": {
+                    "message": {
+                      "description": "Error message.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Method Not Allowed"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "default": {
+                    "value": {
+                      "message": "Internal Server Error"
+                    }
+                  }
+                },
+                "schema": {
+                  "properties": {
+                    "message": {
+                      "description": "Error message.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Generate access token"
+      }
+    }
+  }
+}
