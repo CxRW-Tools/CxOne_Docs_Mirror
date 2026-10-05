@@ -31,8 +31,8 @@ Outputs (all inside --api-out, default ./api; the README describes each file):
     history.json              per-operation signatures between runs
 
 Exit codes: 0 clean / informational drift, 1 fatal (source unreachable or
-needs a login), 10 drift (changed / removed) touches an endpoint listed in
---used-endpoints.
+needs a login), 10 breaking drift touches an endpoint listed in
+--used-endpoints, 11 the shrink guard fired (cxone_openapi.json not written).
 """
 
 from __future__ import annotations
@@ -86,10 +86,13 @@ SERVERS = [
     {"url": "https://anz.ast.checkmarx.net", "description": "Australia & NZ"},
 ]
 
+SIBLING_DIR = "stoplight/refs/"      # files only referenced via $ref, not in the table of contents
 METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
 KINDS = ("schemas", "responses", "parameters", "examples", "requestBodies", "headers", "links")
 EXIT_FATAL = 1
 EXIT_USED_DRIFT = 10
+EXIT_SHRINK = 11              # shrink guard fired (see --allow-shrink)
+SHRINK_LIMIT = 0.05           # more than 5% fewer operations than the baseline
 
 
 class FatalError(RuntimeError):
@@ -471,6 +474,43 @@ async def _fetch_stoplight(client, sem, cfg, raw: RawSet, notes: list[str]) -> N
     rows.sort(key=lambda x: (x["title"], x["id"]))
     raw.put("stoplight/services.json", (json.dumps(rows, indent=2, sort_keys=True) + "\n").encode(),
             f"{proj}/table-of-contents")
+    await _fetch_sibling_refs(client, sem, cfg, raw, notes, rows)
+
+
+_REF_FILE = re.compile(r"\$ref:\s*['\"]?(?:\./)?([^#'\"\s]+?\.ya?ml)#")
+
+
+async def _fetch_sibling_refs(client, sem, cfg, raw: RawSet, notes: list[str], rows: list[dict]) -> None:
+    """Some Stoplight files $ref a sibling file that is not in the table of
+    contents (for example sastResults_copy.yaml). Fetch those from the same
+    project when they exist; a name the project does not have stays unresolved."""
+    if not rows:
+        return
+    base = rows[0]["export_url"].split("/nodes/")[0]
+    known = {r["file"] for r in rows}
+    tried: set[str] = set()
+    for _ in range(3):                                   # refs of refs
+        wanted: set[str] = set()
+        for rel, blob in list(raw.blobs.items()):
+            if rel.startswith("stoplight/") and rel.endswith((".yaml", ".yml")):
+                for m in _REF_FILE.finditer(blob.decode("utf-8", "replace")):
+                    name = unquote(m.group(1))
+                    if name not in known and name not in tried:
+                        wanted.add(name)
+        if not wanted:
+            return
+        for name in sorted(wanted):
+            tried.add(name)
+            url = f"{base}/nodes/{quote(name)}?fromExportButton=true&snapshotType=http_service"
+            rel = f"{SIBLING_DIR}{quote(name, safe='')}"
+            r, err = await _get(client, sem, url, cfg)
+            if r is not None and r.status_code == 200:
+                raw.put(rel, r.content, url)
+            else:
+                code = err or f"HTTP {r.status_code}"
+                raw.put(rel, None, url, "not_found" if r is not None and r.status_code == 404 else "failed", code)
+                notes.append(f"Stoplight sibling file {name!r} is referenced but not available ({code}); "
+                             "its refs stay unresolved")
 
 
 # ===========================================================================
@@ -529,8 +569,9 @@ def _stoplight_prefix(doc: dict) -> tuple[str | None, str, list[str]]:
     return None, "", notes
 
 
-def load_sources(raw: RawSet, notes: list[str]) -> tuple[list[Source], list[Source], list[Source]]:
-    live, extra, sl = [], [], []
+def load_sources(raw: RawSet, notes: list[str]):
+    """(live, extra, stoplight, sibling-ref-only) sources."""
+    live, extra, sl, refs = [], [], [], []
     for row in raw.json("live/catalog.json") or []:
         blob = raw.blobs.get(row["file"])
         if blob is None:
@@ -573,7 +614,16 @@ def load_sources(raw: RawSet, notes: list[str]) -> tuple[list[Source], list[Sour
         s = Source("stoplight", row["id"], row["title"], row["file"], row["relpath"], doc, pfx, src,
                    row["id"], n)
         sl.append(s)
-    return live, extra, sl
+    for rel in sorted(raw.blobs):
+        if rel.startswith(SIBLING_DIR):
+            name = unquote(rel[len(SIBLING_DIR):])
+            try:
+                doc = _load_yaml(raw.blobs[rel])
+            except _yaml().YAMLError:
+                continue
+            if isinstance(doc, dict):
+                refs.append(Source("stoplight", f"ref:{name}", name, name, rel, doc))
+    return live, extra, sl, refs
 
 
 # ===========================================================================
@@ -1148,6 +1198,32 @@ def _diff_paths(a, b, path="", out=None, limit=8):
     return out[:limit]
 
 
+def _prop_paths(node, prefix: str, out: set, depth: int = 0) -> None:
+    """Every property path in a (dereferenced) schema, e.g. `repoId`, `a.b`, `items[].id`."""
+    if not isinstance(node, dict) or depth > 12:
+        return
+    props = node.get("properties")
+    if isinstance(props, dict):
+        for name, sub in props.items():
+            p = f"{prefix}.{name}" if prefix else name
+            out.add(p)
+            _prop_paths(sub, p, out, depth + 1)
+    if isinstance(node.get("items"), dict):
+        _prop_paths(node["items"], prefix + "[]", out, depth + 1)
+    for k in ("allOf", "anyOf", "oneOf"):
+        for sub in node.get(k) or []:
+            _prop_paths(sub, prefix, out, depth + 1)
+
+
+def response_props(doc: dict, op: dict, pp=None) -> set:
+    """Property paths in an operation's 2xx response bodies."""
+    out: set = set()
+    for key, schema in op_facts(doc, op, pp)["responses"].items():
+        if key.startswith("2"):
+            _prop_paths(schema, "", out)
+    return out
+
+
 def _schema_diff(a, b, path="", out=None):
     """Every difference between two schemas as (kind, path, old, new); kind is
     add / remove / change."""
@@ -1364,13 +1440,15 @@ def dangling_refs(doc: dict) -> list[str]:
     return sorted(r for r in refs if _resolve_local(doc, r) is None)
 
 
-def build_spec(lives, extras, sls, overlays, history, info, sl_pref, run_date) -> dict:
+def build_spec(lives, extras, sls, overlays, history, info, sl_pref, run_date, refs=()) -> dict:
     """Merge everything. Returns the spec plus the bookkeeping the manifest,
     drift report and history need."""
     imp = Importer()
     all_live = sorted(lives + extras, key=lambda s: s.key)
     sls = sorted(sls, key=lambda s: (s.name, s.key))
     ctx_of = {id(s): imp.ctx(s) for s in all_live + sls + overlays}
+    for s in refs:                    # resolvable by cross-file $refs, contribute no operations
+        imp.ctx(s)
 
     live_tab, live_unplaced, live_coll = _collect(all_live, lambda s: info[s.key]["prefix"])
     sl_tab, sl_unplaced, sl_coll = _collect(sls, lambda s: sl_pref[s.key][0])
@@ -1390,6 +1468,8 @@ def build_spec(lives, extras, sls, overlays, history, info, sl_pref, run_date) -
         sid = (r.op.get("x-stoplight") or {}).get("id")
         if nk in merged:
             m = merged[nk]
+            pool = {"components": imp.components}
+            m["sl_dropped"] = sorted(response_props(pool, sop) - response_props(pool, m["op"]))
             _enrich(m["op"], sop)
             m["source"] = "both"
             if sid:
@@ -1674,12 +1754,30 @@ def load_used(path: str | None) -> list[tuple]:
     return used
 
 
+def shrink_check(res: dict, baseline_ops: int | None, used: list) -> list[str]:
+    """Reasons the merged spec looks like a partial fetch (empty = fine)."""
+    if baseline_ops is None:
+        return []
+    why = []
+    n = len(res["merged"])
+    if baseline_ops and (baseline_ops - n) / baseline_ops > SHRINK_LIMIT:
+        why.append(f"the merged spec has {n} operations, {100 * (baseline_ops - n) / baseline_ops:.1f}% "
+                   f"fewer than the baseline's {baseline_ops} (limit {int(SHRINK_LIMIT * 100)}%)")
+    keys = set(res["merged"])
+    missing = sorted(f"{m or '*'} {p}" for m, p in used
+                     if not any(np == p and m in (None, nm) for nm, np in keys))
+    if missing:
+        why.append(f"{len(missing)} --used-endpoints entr{'y is' if len(missing) == 1 else 'ies are'} "
+                   f"missing from the merged spec: " + ", ".join(missing[:10]) + (" ..." if len(missing) > 10 else ""))
+    return why
+
+
 def compute_drift(res: dict, baseline: dict | None, new_hist: dict, used: list) -> dict:
     doc, merged = res["doc"], res["merged"]
     bidx = _index_doc(baseline) if baseline else {}
     drift: dict = {"added": [], "changed": [], "deprecated": [], "removed_candidate": [],
                    "baseline_only": [], "prefix_unknown": [], "prefix_conflict": [],
-                   "stoplight_only": []}
+                   "stoplight_only": [], "response_fields_dropped": []}
 
     def rec(nk, extra=None):
         m = merged[nk]
@@ -1710,6 +1808,14 @@ def compute_drift(res: dict, baseline: dict | None, new_hist: dict, used: list) 
             drift["stoplight_only"].append(rec(nk))
         if m["conf"] == "conflict":
             drift["prefix_conflict"].append(rec(nk))
+        # informational: response properties a reference source has and the merged operation lacks
+        from_base = sorted(response_props(baseline, base[2], base[3]) - response_props(doc, op)) \
+            if base is not None else []
+        from_sl = m.get("sl_dropped", [])
+        if from_base or from_sl:
+            drift["response_fields_dropped"].append(rec(nk, {
+                "properties": sorted(set(from_base) | set(from_sl)),
+                "in_baseline": from_base, "in_stoplight": from_sl}))
     for nk in sorted(bidx):
         if nk not in merged:
             path, meth, op, _ = bidx[nk]
@@ -1796,7 +1902,14 @@ def write_report(path: Path, drift: dict, manifest: dict, run_date: str,
          f"Stoplight ({src['stoplight']['services']} services, {src['stoplight']['operations']} ops).",
          f"- **Baseline:** {baseline_label or 'none given - baseline-dependent categories are empty'}"
          + (f" ({drift['baseline_operations']} ops)." if drift["baseline_operations"] is not None else "."),
-         f"- **Validation:** {manifest['validation']['summary']}", "", "## Needs attention", ""]
+         f"- **Validation:** {manifest['validation']['summary']}", ""]
+    g = drift.get("shrink_guard") or {}
+    if g.get("fired"):
+        L += ["## SHRINK GUARD FIRED" + (" (overridden by --allow-shrink)" if g["overridden"]
+                                          else " - cxone_openapi.json was NOT written"), "",
+              "This looks like a partial fetch. Check the fetch problems at the bottom before trusting the numbers.", ""]
+        L += [f"- {w}" for w in g["fired"]] + [""]
+    L += ["## Needs attention", ""]
     ue = drift["used_endpoints"]
     if ue["checked"]:
         L += [f"### Endpoints you use with BREAKING drift ({len(ue['breaking'])} operations; "
@@ -1845,6 +1958,15 @@ def write_report(path: Path, drift: dict, manifest: dict, run_date: str,
     L += _table([[svc, len(keys), ", ".join(keys[:3]) + (" ..." if len(keys) > 3 else "")]
                  for svc, keys in sorted(by_svc.items())],
                 ["Service", "New ops", "Examples"], cap=40) if by_svc else ["None."]
+    L += ["", f"### Response fields dropped ({s['response_fields_dropped']}) - check before adopting", "",
+          "Properties the baseline or Stoplight returns that the live schema does not list. Live schemas can "
+          "omit fields that really exist (for example `repoId` on `GET /api/projects/{id}`). Informational; "
+          "never fails a run.", ""]
+    L += _table([[r["key"], ", ".join(r["properties"][:8]) + (" ..." if len(r["properties"]) > 8 else ""),
+                  "baseline" if r["in_baseline"] and not r["in_stoplight"] else
+                  "Stoplight" if r["in_stoplight"] and not r["in_baseline"] else "both"]
+                 for r in drift["response_fields_dropped"]],
+                ["Operation", "Properties", "Seen in"]) if drift["response_fields_dropped"] else ["None."]
     L += ["", f"### Stoplight-only ({s['stoplight_only']}) - not served by the live catalog", ""]
     L += _table([[r["key"], r["service"]] for r in drift["stoplight_only"]],
                 ["Operation", "Stoplight service"]) if drift["stoplight_only"] else ["None."]
@@ -1981,7 +2103,7 @@ def _run(cfg) -> int:
         if not cfg.dry_run:
             raw.save(raw_dir)
 
-    lives, extras, sls = load_sources(raw, notes)
+    lives, extras, sls, refs = load_sources(raw, notes)
     if not lives or not sls:
         raise FatalError("no live or Stoplight specs could be loaded")
     overlays = load_overlay(cfg.overlay_dir)
@@ -1998,13 +2120,18 @@ def _run(cfg) -> int:
     if cfg.probe:
         print("[api-spec] probing declared prefixes (read-only, unauthenticated)")
         asyncio.run(probe_prefixes(cfg, info, lives + extras))
-    res = build_spec(lives, extras, sls, overlays, history, info, sl_pref, run_date)
+    res = build_spec(lives, extras, sls, overlays, history, info, sl_pref, run_date, refs)
     res["doc"]["info"]["x-sync-notes"] = (
         f"cx_docs_mirror api-spec stage. Live: {len(lives)} services from {cfg.base_url}; "
         f"Stoplight: {len(sls)} services; overlay files: {len(overlays)}. "
         "Schemas, parameters, enums and required-ness come from live; prose and examples from Stoplight.")
     new_hist = update_history(history, res["live_sigs"], run_date)
-    drift = compute_drift(res, baseline, new_hist, load_used(cfg.used_endpoints))
+    used = load_used(cfg.used_endpoints)
+    drift = compute_drift(res, baseline, new_hist, used)
+    fired = shrink_check(res, drift["baseline_operations"], used)
+    blocked = bool(fired) and not cfg.allow_shrink
+    drift["shrink_guard"] = {"checked": baseline is not None, "limit": SHRINK_LIMIT, "fired": fired,
+                             "overridden": bool(fired) and cfg.allow_shrink, "spec_written": not blocked}
     validation = validate_openapi(res["doc"], cfg.skip_validation)
     manifest = build_manifest(res, raw, drift, validation, cfg, run_date, lives, extras, sls)
     drift = {"run_date": run_date, "baseline": cfg.baseline, **drift}
@@ -2012,10 +2139,11 @@ def _run(cfg) -> int:
     report = out / "API-SPEC-REPORT.md"
     write_report(report, drift, manifest, run_date, cfg.baseline, notes)
     if not cfg.dry_run:
-        dump_json(out / "cxone_openapi.json", res["doc"])
+        if not blocked:
+            dump_json(out / "cxone_openapi.json", res["doc"])
         dump_json(out / "api-spec-manifest.json", manifest)
         dump_json(out / "api-spec-drift.json", drift)
-        if fetched:   # a rebuild from saved raw files must not count as another run
+        if fetched and not blocked:   # a rebuild from saved raw files, or a blocked run, is not a new run
             dump_json(hist_path, new_hist)
 
     c = manifest["counts"]
@@ -2024,6 +2152,12 @@ def _run(cfg) -> int:
     for n in notes:
         print(f"[api-spec] note: {n}")
     print(f"[api-spec] report: {report}" + (" (dry run: nothing else written)" if cfg.dry_run else ""))
+    if blocked:
+        print("[api-spec] SHRINK GUARD fired; cxone_openapi.json was NOT written "
+              "(inspect the report, or pass --allow-shrink):", file=sys.stderr)
+        for w in fired:
+            print(f"[api-spec]   - {w}", file=sys.stderr)
+        return EXIT_SHRINK
     return EXIT_USED_DRIFT if drift["used_endpoints"]["breaking"] else 0
 
 
@@ -2040,6 +2174,9 @@ def add_arguments(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--from-raw", metavar="DIR", help="Rebuild from an earlier raw/ directory, no network")
     g.add_argument("--probe", action="store_true",
                    help="Confirm declared prefixes with a few unauthenticated GETs (off by default)")
+    g.add_argument("--allow-shrink", action="store_true",
+                   help="With --baseline: write the spec even if the shrink guard fires "
+                        "(>5%% fewer operations than the baseline, or a --used-endpoints entry missing)")
     g.add_argument("--auth-token-env", metavar="VAR",
                    help="Name of an environment variable holding a tenant bearer token. Opt-in: "
                         "used only to fetch the extra services that need a login; never stored or printed")
@@ -2064,6 +2201,7 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
         probe=getattr(args, "probe", False), run_date=getattr(args, "run_date", None),
         skip_validation=getattr(args, "skip_validation", False),
         auth_token_env=getattr(args, "auth_token_env", None), auth_token=None,
+        allow_shrink=getattr(args, "allow_shrink", False),
         concurrency=API_CONCURRENCY, timeout=API_TIMEOUT, retries=API_RETRIES,
         allowed_hosts={(urlparse(base).hostname or "").lower(), "stoplight.io", "checkmarx.stoplight.io"})
 

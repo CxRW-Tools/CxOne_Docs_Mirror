@@ -82,7 +82,7 @@ def cfg_for(root: str, raw_dir: str, out: str, baseline=None):
         base_url="https://ast.example.test", extra_services=[], out_dir=os.path.join(root, out),
         overlay_dir=empty_overlay, baseline=baseline, used_endpoints=None, dry_run=False,
         from_raw=raw_dir, probe=False, run_date="2026-01-01", skip_validation=True,
-        auth_token_env=None, auth_token=None, concurrency=4, timeout=5, retries=1,
+        auth_token_env=None, auth_token=None, allow_shrink=False, concurrency=4, timeout=5, retries=1,
         allowed_hosts={"ast.example.test"})
 
 
@@ -211,18 +211,20 @@ class UsedEndpointExit(unittest.TestCase):
             "/api/gone": {"get": op("x")},
             "/api/contributors/csv": {"get": op("Export csv")}}})
 
-    def exit_code(self, used_line):
+    def exit_code(self, used_line, allow=False):
         used = os.path.join(self.root, "used.txt")
         write_text(used, used_line)
         cfg = cfg_for(self.root, self.raw, "u", self.base)
         cfg.used_endpoints = used
+        cfg.allow_shrink = allow
         return A.run(cfg)
 
     def test_unchanged_used_endpoint_exits_zero(self):
         self.assertEqual(self.exit_code("GET /api/contributors/csv\n"), 0)
 
-    def test_missing_used_endpoint_exits_ten(self):
-        self.assertEqual(self.exit_code("GET /api/gone\n"), A.EXIT_USED_DRIFT)
+    def test_missing_used_endpoint_trips_the_guard_then_exits_ten_when_allowed(self):
+        self.assertEqual(self.exit_code("GET /api/gone\n"), A.EXIT_SHRINK)
+        self.assertEqual(self.exit_code("GET /api/gone\n", allow=True), A.EXIT_USED_DRIFT)
 
 
 class OverlayKeep(unittest.TestCase):

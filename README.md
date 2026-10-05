@@ -41,6 +41,9 @@ Useful flags:
 | `--probe` | API: confirm gateway prefixes with a few unauthenticated GETs |
 | `--skip-validation` | API: skip the OpenAPI 3.0 validator (it runs by default) |
 | `--auth-token-env VAR` | API: opt in to authenticated fetching of the extra services (see below); `VAR` names an environment variable holding a tenant bearer token |
+| `--allow-shrink` | API: write the spec even if the shrink guard fires (see below) |
+
+API exit codes: `0` ok, `1` fatal (source unreachable or needs a login), `10` breaking drift on an endpoint in `--used-endpoints`, `11` the shrink guard fired and `cxone_openapi.json` was not written.
 
 No credentials are used by default. The `ai-triage` and `remediation` `openapi.json` files need a login, so they are reported and skipped unless you opt in with `--auth-token-env`.
 
@@ -84,7 +87,7 @@ api/                                    API spec (generated, gitignored except o
 |---|---|---|---|---|
 | `cxone_openapi.json` | api-spec | The merged OpenAPI 3.0.3 spec. Schemas, parameters, enums and required-ness come from the live catalog; summaries, descriptions and examples from Stoplight. Every operation carries `x-source`, `x-service`, `x-gateway-prefix` and `x-live-verified`. Sorted and stable, so unchanged sources give an identical file. | **The deliverable.** A candidate to review and then adopt. | Rewritten each run |
 | `API-SPEC-REPORT.md` | api-spec | Short summary of the drift, highest risk first, plus validation result and fetch problems | Read this first | Rewritten each run; the only file `--dry-run` writes |
-| `api-spec-drift.json` | api-spec | Diff against `--baseline`, keyed by `METHOD /path`: added, changed (with what changed), deprecated, removed candidates, baseline-only, stoplight-only, prefix-unknown, overlay | Machine-readable drift; intersect with the endpoints your code calls | Rewritten each run |
+| `api-spec-drift.json` | api-spec | Diff against `--baseline`, keyed by `METHOD /path`: added, changed (with what changed), deprecated, removed candidates, baseline-only, stoplight-only, prefix-unknown, prefix-conflict, response-fields-dropped, overlay, and the shrink-guard result | Machine-readable drift; intersect with the endpoints your code calls | Rewritten each run |
 | `api-spec-manifest.json` | api-spec | Services found, counts, the gateway-prefix map with confidence, unplaced operations, unresolved refs, repairs made, validation result | Audit how the spec was built | Rewritten each run |
 | `history.json` | api-spec | Per-operation signatures from earlier runs | Detects removals (missing from live in two runs in a row) and keeps `x-live-verified` stable | Kept; updated only by runs that fetch |
 | `raw/provenance.json` | api-spec | Source URL, fetch time, SHA-256 and status for every raw file | Traceability | Rewritten each fetch |
@@ -136,6 +139,36 @@ python cx_docs_mirror.py --stage api-spec --auth-token-env CX_TOKEN
 ```
 
 The token is read from the environment, sent only to the `--api-base-url` host for those two requests (never to Stoplight, never followed across redirects), and is not written to disk or printed. Use a token for the same tenant as `--api-base-url`. The downloaded specs land in `api/raw/live/extra-*.json` and are merged as live sources, after which the overlay entries become redundant (the report says so). **No credentials may be committed to this repository.**
+
+### Shrink guard
+
+A partial fetch could silently produce a smaller spec. With `--baseline`, the run exits with code `11` and does **not** write `cxone_openapi.json` (or update `history.json`) when either holds:
+
+- the merged spec has more than 5% fewer operations than the baseline;
+- any `--used-endpoints` entry is missing from the merged spec.
+
+`API-SPEC-REPORT.md` is always written, starts with a "SHRINK GUARD FIRED" section naming the check, and lists fetch problems at the bottom. Pass `--allow-shrink` to write the spec anyway (the report then says the guard was overridden). Without `--baseline` the guard does not run.
+
+### Response fields dropped (informational)
+
+Live schemas can omit fields that really exist: on a real tenant `GET /api/projects/{id}` returns `repoId`, `privatePackage` and `imported_proj_name`, but the live schema lists none of them. The `response_fields_dropped` drift category lists, per `METHOD /path`, the 2xx response properties that the baseline or Stoplight has and the merged operation lacks (nested ones as `tags.test`, array items as `items[].id`). It never fails a run and never alters the spec; it exists so a reviewer checks those operations before adopting. Against an unchanged baseline the baseline-derived part is empty; Stoplight-derived entries remain for as long as Stoplight and live disagree.
+
+### What this tool cannot see
+
+It runs unauthenticated, so it cannot see what needs a login or what no published source describes: the `ai-triage` and `remediation` specs, credits, and routes you only know from an authenticated tenant. Cover those with your own overlay (`--overlay`); an overlay entry is the right place for them, and the report tells you when a source starts covering one.
+
+If you use `--auth-token-env`, it needs an already-issued bearer token, and `--api-base-url` must point at the tenant that issued it (the default is the US host, `https://ast.checkmarx.net`). The DEU and US live catalogs were identical for all 70 services on 2026-10-05, so the default region is fine for the catalog itself.
+
+### Known limits
+
+- **Cross-file `$ref`s.** Stoplight files sometimes `$ref` a sibling file that is not in the table of contents (for example `sastResults_copy.yaml`). The tool fetches those from the same Stoplight project into `api/raw/stoplight/refs/` and resolves against them. A name the project does not have stays unresolved and is listed in the manifest and report, never guessed. Today that is `Scans.yaml` (one Reports parameter) and `multiEngineResults.yaml` (three Best Fix Location schemas, from the live catalog, which has no sibling files), plus five unresolved local refs in the baseline-derived overlay.
+- **`SAST_QUERIES_AUDIT`** is placed at `/api/cx-audit` and flagged `conflict`. `/queries` is served there, but `GET /sessions` is 404 under `/api/cx-audit` and 405 under `/api/query-editor` (405 means the route exists for another method). Treat the `sessions` paths as unconfirmed, and do not "fix" this without evidence from a tenant.
+- **`INTEGRATIONS_REPOS`** declares the unusable prefix `REPOS` in the live catalog, so its operations stay unplaced.
+- **Line endings.** Output is LF. Git on Windows may check files out as CRLF, so normalise line endings before comparing a file with a fresh run.
+
+### Adopting the output
+
+The adoption procedure lives in the consumer repo: see "Refreshing the spec" in [`spec/CLEANUP_NOTES.md`](https://github.com/CxRW-Tools/CxOne_Multi-Tool/blob/main/spec/CLEANUP_NOTES.md).
 
 ### Resetting `history.json`
 
