@@ -1,0 +1,1016 @@
+{
+  "info": {
+    "title": "Overlay: AI service operations that need an authenticated spec fetch",
+    "version": "2026-10-05"
+  },
+  "openapi": "3.0.3",
+  "paths": {
+    "/api/ai-triage/v2/triage": {
+      "post": {
+        "description": "Start a multi-scan bulk triage job (one triageJobId across N scans).",
+        "operationId": "create_triage_v2_v2_triage_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-correlation-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Correlation-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "POST /v2/triage request body.",
+                "properties": {
+                  "applicationID": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Applicationid"
+                  },
+                  "projectID": {
+                    "minLength": 1,
+                    "title": "Projectid",
+                    "type": "string"
+                  },
+                  "selection": {
+                    "items": {
+                      "description": "One (scan, engine) slice in a v2 selection array.",
+                      "properties": {
+                        "resultIDs": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "minItems": 1,
+                          "title": "Resultids",
+                          "type": "array"
+                        },
+                        "scanID": {
+                          "minLength": 1,
+                          "title": "Scanid",
+                          "type": "string"
+                        },
+                        "scannerType": {
+                          "minLength": 1,
+                          "title": "Scannertype",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "scanID",
+                        "scannerType",
+                        "resultIDs"
+                      ],
+                      "title": "TriageV2SelectionRow",
+                      "type": "object"
+                    },
+                    "minItems": 1,
+                    "title": "Selection",
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "projectID",
+                  "selection"
+                ],
+                "title": "TriageV2Request",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "POST /v2/triage 202 response.",
+                  "properties": {
+                    "expectedGroups": {
+                      "title": "Expectedgroups",
+                      "type": "integer"
+                    },
+                    "expectedTotal": {
+                      "title": "Expectedtotal",
+                      "type": "integer"
+                    },
+                    "published": {
+                      "default": true,
+                      "title": "Published",
+                      "type": "boolean"
+                    },
+                    "selection": {
+                      "items": {
+                        "properties": {
+                          "adopted": {
+                            "default": 0,
+                            "title": "Adopted",
+                            "type": "integer"
+                          },
+                          "groups": {
+                            "default": 0,
+                            "title": "Groups",
+                            "type": "integer"
+                          },
+                          "published": {
+                            "default": 0,
+                            "title": "Published",
+                            "type": "integer"
+                          },
+                          "scanID": {
+                            "title": "Scanid",
+                            "type": "string"
+                          },
+                          "scannerType": {
+                            "title": "Scannertype",
+                            "type": "string"
+                          },
+                          "triageId": {
+                            "title": "Triageid",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "scanID",
+                          "scannerType",
+                          "triageId"
+                        ],
+                        "title": "TriageV2SelectionOutcomeRow",
+                        "type": "object"
+                      },
+                      "title": "Selection",
+                      "type": "array"
+                    },
+                    "status": {
+                      "default": "accepted",
+                      "title": "Status",
+                      "type": "string"
+                    },
+                    "triageJobId": {
+                      "title": "Triagejobid",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "triageJobId",
+                    "expectedTotal",
+                    "expectedGroups"
+                  ],
+                  "title": "TriageAcceptedV2Response",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "Validation, limits, scan/project mismatch, or result not found"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Standard error body for documented 4xx/5xx responses.",
+                  "properties": {
+                    "error": {
+                      "minLength": 1,
+                      "title": "Error",
+                      "type": "string"
+                    },
+                    "message": {
+                      "minLength": 1,
+                      "title": "Message",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "message"
+                  ],
+                  "title": "TriageErrorResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Authentication failed"
+          },
+          "402": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Standard error body for documented 4xx/5xx responses.",
+                  "properties": {
+                    "error": {
+                      "minLength": 1,
+                      "title": "Error",
+                      "type": "string"
+                    },
+                    "message": {
+                      "minLength": 1,
+                      "title": "Message",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "message"
+                  ],
+                  "title": "TriageErrorResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Insufficient AI consumption credits"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Standard error body for documented 4xx/5xx responses.",
+                  "properties": {
+                    "error": {
+                      "minLength": 1,
+                      "title": "Error",
+                      "type": "string"
+                    },
+                    "message": {
+                      "minLength": 1,
+                      "title": "Message",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "message"
+                  ],
+                  "title": "TriageErrorResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Feature not enabled, AI consumption license inactive, or insufficient roles"
+          },
+          "404": {
+            "description": "AI Triage could not run. The scan was not found."
+          },
+          "422": {
+            "description": "Validation error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Standard error body for documented 4xx/5xx responses.",
+                  "properties": {
+                    "error": {
+                      "minLength": 1,
+                      "title": "Error",
+                      "type": "string"
+                    },
+                    "message": {
+                      "minLength": 1,
+                      "title": "Message",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "message"
+                  ],
+                  "title": "TriageErrorResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "External service unavailable"
+          }
+        },
+        "summary": "Create Triage V2",
+        "tags": [
+          "triage"
+        ],
+        "x-live-verified": "2026-10-05",
+        "x-source": "authenticated live ai-triage openapi.json (GET {base_url}/api/ai-triage/openapi.json needs a login, so the unauthenticated catalog cannot supply it): not in any unauthenticated source"
+      }
+    },
+    "/api/remediation/remediate": {
+      "post": {
+        "description": "Handle POST /remediate requests.\n\nThis endpoint triggers remediation for one or more scan results (same scan).\nThe request is validated automatically by FastAPI/Pydantic.\nAuthentication is handled by the get_jwt_claims dependency.\n\nArgs:\n    request: The validated remediation request body.\n    response: FastAPI response object for setting headers.\n    correlation_id: Correlation ID from header or generated.\n    claims: JWT claims containing tenant_id and user_id.\n    tenant_id: Same as ``claims.tenant_id``; provided separately so\n        ``@feature_flag_enabled(..., tenant_id_param=\"tenant_id\")`` can bind the\n        route parameter by name.\n    handler: The remediate handler injected via dependency.\n\nReturns:\n    AcceptedResponse: 202 Accepted response. ``published`` is ``true`` when a new\n        remediation pipeline event was published and ``false`` on an idempotent\n        duplicate; ``existingState`` then reports the duplicate's state\n        (``\"processing\"`` or ``\"completed\"``) and is ``null`` when ``published`` is true.\n\nRaises:\n    HTTPException: 400 if the scan's source code is no longer available in RepoStore.\n    HTTPException: 401 if authentication fails or required claims are missing.\n    HTTPException: 403 if the feature flag, license, or role checks deny access.\n    HTTPException: 503 if SecurityContext was not initialized (e.g. missing middleware).\n    HTTPException: 402 if consumption enforcement is on and credits are insufficient.\n    HTTPException: 503 if consumption enforcement is on and CGWS is unavailable.\n    HTTPException: 500 if publishing to RabbitMQ fails.",
+        "operationId": "remediate_remediate_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-correlation-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Correlation-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "Request model for the POST /remediate endpoint.\n\nUses Pydantic for automatic validation and type coercion.\nField aliases map camelCase JSON keys to snake_case Python attributes.\n\nThe body must include ``buckets``: a non-empty list of per-engine result groups.\n\nAttributes:\n    scan_id: The unique identifier of the scan.\n    buckets: Per-engine result groupings (one bucket may hold a single engine).\n    project_id: Optional project UUID.",
+                "properties": {
+                  "buckets": {
+                    "items": {
+                      "description": "One scanner engine and its result ids for bulk / mixed-engine remediation.",
+                      "properties": {
+                        "resultIDs": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "minItems": 1,
+                          "title": "Resultids",
+                          "type": "array"
+                        },
+                        "scannerType": {
+                          "minLength": 1,
+                          "title": "Scannertype",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "scannerType",
+                        "resultIDs"
+                      ],
+                      "title": "RemediationBucket",
+                      "type": "object"
+                    },
+                    "minItems": 1,
+                    "title": "Buckets",
+                    "type": "array"
+                  },
+                  "projectID": {
+                    "default": "",
+                    "title": "Projectid",
+                    "type": "string"
+                  },
+                  "scanID": {
+                    "minLength": 1,
+                    "title": "Scanid",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "scanID",
+                  "buckets"
+                ],
+                "title": "RemediateRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Response model for accepted requests (HTTP 202).\n\nAttributes:\n    status: The status of the request, always \"accepted\".\n    published: ``True`` when a new remediation pipeline event was published;\n        ``False`` on an idempotent duplicate (nothing was enqueued).\n    existing_state: When ``published`` is ``False``, the existing Redis\n        idempotency state of the duplicate (``\"processing\"`` or ``\"completed\"``);\n        ``None`` when ``published`` is ``True``.\n    remediation_job_id: Per-job UUID the UI passes to the SSE gateway as\n        ``/remediation-job-status?remediationId=`` (wire: ``remediationJobId``).\n        ``None`` on an idempotent duplicate (no new job was created).",
+                  "properties": {
+                    "existingState": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Existingstate"
+                    },
+                    "published": {
+                      "default": true,
+                      "title": "Published",
+                      "type": "boolean"
+                    },
+                    "remediationJobId": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Remediationjobid"
+                    },
+                    "status": {
+                      "default": "accepted",
+                      "title": "Status",
+                      "type": "string"
+                    }
+                  },
+                  "title": "AcceptedResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Response model for error responses.\n\nAttributes:\n    error: The error message.",
+                  "properties": {
+                    "error": {
+                      "title": "Error",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "title": "ErrorResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Requested resultID not found in the scan for its engine, or the scan's source code is no longer available"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Response model for error responses.\n\nAttributes:\n    error: The error message.",
+                  "properties": {
+                    "error": {
+                      "title": "Error",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "title": "ErrorResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Authentication failed"
+          },
+          "402": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Response model for error responses.\n\nAttributes:\n    error: The error message.",
+                  "properties": {
+                    "error": {
+                      "title": "Error",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "title": "ErrorResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Insufficient AI consumption credits"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Response model for error responses.\n\nAttributes:\n    error: The error message.",
+                  "properties": {
+                    "error": {
+                      "title": "Error",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "title": "ErrorResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Feature not enabled"
+          },
+          "422": {
+            "description": "Validation error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Response model for error responses.\n\nAttributes:\n    error: The error message.",
+                  "properties": {
+                    "error": {
+                      "title": "Error",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "title": "ErrorResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "Authentication context unavailable, consumption gateway unavailable, SAST/SCA engine unavailable while validating result ids, or similar service issue"
+          }
+        },
+        "summary": "Remediate",
+        "tags": [
+          "remediation"
+        ],
+        "x-live-verified": "2026-10-05",
+        "x-overlay-keep": true,
+        "x-source": "authenticated live remediation openapi.json (GET {base_url}/api/remediation/openapi.json needs a login, so the unauthenticated catalog cannot supply it): replaces the Stoplight operation, which lacks the live projectID request field"
+      }
+    },
+    "/api/remediation/remediation/{remediation_id}/export": {
+      "get": {
+        "description": "Return the patch and agent prompt for a completed remediation.",
+        "operationId": "get_remediation_export_remediation__remediation_id__export_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "remediation_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Remediation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-correlation-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Correlation-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "200 OK response for GET /remediation/{remediation_id}/export.\n\nCarries everything the three delivery doors need: ``patch`` for copy and\ndownload, ``agentPrompt`` for handing the fix to a coding agent. The patch\nis embedded in both, which is intentional - the doors are independent.",
+                  "properties": {
+                    "agentPrompt": {
+                      "default": "",
+                      "title": "Agentprompt",
+                      "type": "string"
+                    },
+                    "branch": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Branch"
+                    },
+                    "commit": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Commit the scan ran against; null for non-git-sourced scans",
+                      "title": "Commit"
+                    },
+                    "filesIncluded": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "title": "Filesincluded",
+                      "type": "array"
+                    },
+                    "filesSkipped": {
+                      "items": {
+                        "description": "A file change that could not be represented in the copyable patch.",
+                        "properties": {
+                          "path": {
+                            "minLength": 1,
+                            "title": "Path",
+                            "type": "string"
+                          },
+                          "reason": {
+                            "description": "One of: no-diff, empty-diff, binary, duplicate",
+                            "title": "Reason",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "path",
+                          "reason"
+                        ],
+                        "title": "RemediationSkippedFileSchema",
+                        "type": "object"
+                      },
+                      "title": "Filesskipped",
+                      "type": "array"
+                    },
+                    "patch": {
+                      "default": "",
+                      "description": "Concatenated unified diff; empty when no file change was appliable",
+                      "title": "Patch",
+                      "type": "string"
+                    },
+                    "patchFileName": {
+                      "minLength": 1,
+                      "title": "Patchfilename",
+                      "type": "string"
+                    },
+                    "remediationID": {
+                      "minLength": 1,
+                      "title": "Remediationid",
+                      "type": "string"
+                    },
+                    "resultID": {
+                      "minLength": 1,
+                      "title": "Resultid",
+                      "type": "string"
+                    },
+                    "scanID": {
+                      "minLength": 1,
+                      "title": "Scanid",
+                      "type": "string"
+                    },
+                    "summary": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Summary"
+                    }
+                  },
+                  "required": [
+                    "remediationID",
+                    "scanID",
+                    "resultID",
+                    "patchFileName"
+                  ],
+                  "title": "RemediationExportResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Copyable patch and coding-agent prompt for the remediation"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Response model for error responses.\n\nAttributes:\n    error: The error message.",
+                  "properties": {
+                    "error": {
+                      "title": "Error",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "title": "ErrorResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Authentication failed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Response model for error responses.\n\nAttributes:\n    error: The error message.",
+                  "properties": {
+                    "error": {
+                      "title": "Error",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "title": "ErrorResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Remediation not found"
+          },
+          "409": {
+            "description": "Remediation has not finished yet"
+          },
+          "422": {
+            "description": "Validation error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Response model for error responses.\n\nAttributes:\n    error: The error message.",
+                  "properties": {
+                    "error": {
+                      "title": "Error",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "title": "ErrorResponse",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Get Remediation Export",
+        "tags": [
+          "remediation"
+        ],
+        "x-live-verified": "2026-10-05",
+        "x-source": "authenticated live remediation openapi.json (GET {base_url}/api/remediation/openapi.json needs a login, so the unauthenticated catalog cannot supply it): not in any unauthenticated source"
+      }
+    },
+    "/api/remediation/v2/remediate": {
+      "post": {
+        "operationId": "remediate_v2_v2_remediate_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-correlation-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Correlation-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "POST /v2/remediate body \u2014 multi-scan bulk selection.",
+                "properties": {
+                  "projectID": {
+                    "minLength": 1,
+                    "title": "Projectid",
+                    "type": "string"
+                  },
+                  "selection": {
+                    "items": {
+                      "description": "One (scan, engine) group in a v2 bulk selection.",
+                      "properties": {
+                        "resultIDs": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "minItems": 1,
+                          "title": "Resultids",
+                          "type": "array"
+                        },
+                        "scanID": {
+                          "minLength": 1,
+                          "title": "Scanid",
+                          "type": "string"
+                        },
+                        "scannerType": {
+                          "minLength": 1,
+                          "title": "Scannertype",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "scanID",
+                        "scannerType",
+                        "resultIDs"
+                      ],
+                      "title": "SelectionSlice",
+                      "type": "object"
+                    },
+                    "minItems": 1,
+                    "title": "Selection",
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "projectID",
+                  "selection"
+                ],
+                "title": "RemediateV2Request",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "202 Accepted for POST /v2/remediate.",
+                  "properties": {
+                    "expectedTotal": {
+                      "minimum": 0.0,
+                      "title": "Expectedtotal",
+                      "type": "integer"
+                    },
+                    "published": {
+                      "default": true,
+                      "title": "Published",
+                      "type": "boolean"
+                    },
+                    "remediationJobId": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "title": "Remediationjobid"
+                    },
+                    "selection": {
+                      "items": {
+                        "description": "One selection entry with publish/adopt counts (replaces resultIDs).",
+                        "properties": {
+                          "adopted": {
+                            "minimum": 0.0,
+                            "title": "Adopted",
+                            "type": "integer"
+                          },
+                          "published": {
+                            "minimum": 0.0,
+                            "title": "Published",
+                            "type": "integer"
+                          },
+                          "scanID": {
+                            "title": "Scanid",
+                            "type": "string"
+                          },
+                          "scannerType": {
+                            "title": "Scannertype",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "scanID",
+                          "scannerType",
+                          "published",
+                          "adopted"
+                        ],
+                        "title": "SelectionOutcomeSlice",
+                        "type": "object"
+                      },
+                      "title": "Selection",
+                      "type": "array"
+                    },
+                    "status": {
+                      "default": "accepted",
+                      "title": "Status",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "expectedTotal"
+                  ],
+                  "title": "AcceptedV2Response",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "detail": {
+                      "items": {
+                        "properties": {
+                          "ctx": {
+                            "title": "Context",
+                            "type": "object"
+                          },
+                          "input": {
+                            "title": "Input"
+                          },
+                          "loc": {
+                            "items": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "integer"
+                                }
+                              ]
+                            },
+                            "title": "Location",
+                            "type": "array"
+                          },
+                          "msg": {
+                            "title": "Message",
+                            "type": "string"
+                          },
+                          "type": {
+                            "title": "Error Type",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "loc",
+                          "msg",
+                          "type"
+                        ],
+                        "title": "ValidationError",
+                        "type": "object"
+                      },
+                      "title": "Detail",
+                      "type": "array"
+                    }
+                  },
+                  "title": "HTTPValidationError",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remediate V2",
+        "tags": [
+          "remediation"
+        ],
+        "x-live-verified": "2026-10-05",
+        "x-source": "authenticated live remediation openapi.json (GET {base_url}/api/remediation/openapi.json needs a login, so the unauthenticated catalog cannot supply it): not in any unauthenticated source"
+      }
+    }
+  }
+}

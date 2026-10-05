@@ -71,6 +71,7 @@ API_CONCURRENCY = 4                             # hard politeness cap
 API_TIMEOUT = 60.0
 API_RETRIES = 3
 PROBE_DELAY = 0.5                               # seconds between gateway probes
+HISTORY_VERSION = 2          # bumped when placement logic changed; older history is discarded
 REMOVED_AFTER_RUNS = 2                          # absent from live this many runs in a row
 
 USER_AGENT = ("cxone-docs-mirror/2.0 api-spec "
@@ -272,7 +273,7 @@ def checked_url(url: str, allowed_hosts) -> str:
     return url
 
 
-async def _get(client, sem, url: str, cfg) -> tuple[object | None, str | None]:
+async def _get(client, sem, url: str, cfg, headers=None) -> tuple[object | None, str | None]:
     """The single choke point for network reads. GET with bounded retries on
     transport errors / 429 / 5xx. Returns (response, None) or (None, error);
     4xx other than 429 are returned as-is."""
@@ -285,7 +286,9 @@ async def _get(client, sem, url: str, cfg) -> tuple[object | None, str | None]:
     for attempt in range(cfg.retries):
         try:
             async with sem:
-                r = await client.get(url, timeout=cfg.timeout)
+                # a request carrying credentials must never follow a redirect elsewhere
+                r = await client.get(url, timeout=cfg.timeout, headers=headers,
+                                     follow_redirects=headers is None)
             if r.status_code == 429 or r.status_code >= 500:
                 err = f"HTTP {r.status_code}"
             else:
@@ -368,13 +371,18 @@ async def fetch_all(cfg, prev: RawSet | None) -> tuple[RawSet, list[str]]:
         async def fetch_extra(svc):
             url = f"{base}/api/{svc}/openapi.json"
             rel = f"live/extra-{safe_key(svc)}.json"
-            r, err = await _get(client, sem, url, cfg)
+            token = getattr(cfg, "auth_token", None)
+            r, err = await _get(client, sem, url, cfg,
+                                {"Authorization": f"Bearer {token}"} if token else None)
             if r is None:
                 raw.put(rel, None, url, "failed", err)
                 notes.append(f"extra service {svc}: {err}")
             elif r.status_code in (401, 403):
                 raw.put(rel, None, url, "auth_required", f"HTTP {r.status_code}")
-                notes.append(f"extra service {svc}: needs a login (HTTP {r.status_code}); skipped")
+                notes.append(f"extra service {svc}: " + (
+                    f"the token was rejected (HTTP {r.status_code}); use a token for the same tenant as "
+                    f"{cfg.base_url}" if token else
+                    f"needs a login (HTTP {r.status_code}); skipped (see --auth-token-env)"))
             elif r.status_code != 200:
                 raw.put(rel, None, url, "failed", f"HTTP {r.status_code}")
                 notes.append(f"extra service {svc}: HTTP {r.status_code}")
@@ -548,13 +556,8 @@ def load_sources(raw: RawSet, notes: list[str]) -> tuple[list[Source], list[Sour
             except ValueError:
                 continue
             svc = rel[len("live/extra-"):-len(".json")]
-            servers = doc.get("servers") or []
-            pfx = server_prefix(servers[0].get("url")) if servers and isinstance(servers[0], dict) else None
-            if pfx is None:
-                pfx, src = f"/api/{svc}", "extra-service-route"
-            else:
-                src = "live-servers"
-            extra.append(Source("extra", f"extra-{svc}", svc, f"extra-{svc}.json", rel, doc, pfx, src))
+            extra.append(Source("extra", f"extra-{svc}", svc, f"extra-{svc}.json", rel, doc,
+                                f"/api/{svc}", "extra-service-route"))
     for row in raw.json("stoplight/services.json") or []:
         blob = raw.blobs.get(row["relpath"])
         if blob is None:
@@ -909,90 +912,68 @@ def _s(v) -> str:
     return v.strip().lower() if isinstance(v, str) else ""
 
 
-def _score(a: dict, b: dict) -> tuple[int, int]:
-    """(matched ops, matched-with-operationId-or-summary) between two
-    {(METHOD, normalised relative path): op} maps."""
-    n = bonus = 0
-    for k, op in a.items():
-        other = b.get(k)
-        if other is None:
-            continue
-        n += 1
-        if (_s(op.get("operationId")) and _s(op.get("operationId")) == _s(other.get("operationId"))) or \
-           (_s(op.get("summary")) and _s(op.get("summary")) == _s(other.get("summary"))):
-            bonus += 1
-    return n, bonus
+TRIVIAL_PATHS = {"/", "/{}"}     # a bare "/" or "/{id}" says nothing about which service owns it
+MIN_STOPLIGHT_MATCHES = 2        # several non-trivial operations must agree before Stoplight counts
+
+
+def _score(a: dict, b: dict) -> int:
+    """How many NON-TRIVIAL operations two {(METHOD, normalised relative path): op}
+    maps share. Bare `/` and `/{id}` never count: nearly every service has them."""
+    return sum(1 for k in a if k[1] not in TRIVIAL_PATHS and k in b)
 
 
 def _rel_map(src: Source) -> dict:
     return {(m.upper(), norm_path(p or "/")): op for p, m, op, _ in iter_ops(src.doc)}
 
 
-def learn_prefixes(lives: list[Source], sls: list[Source], baseline_keys: set):
+def _stoplight_prefix_for(lrel: dict, sls: list[Source], sl_ops: dict):
+    """(prefix, service name) of the Stoplight service these operations match, or
+    (None, None). Needs MIN_STOPLIGHT_MATCHES non-trivial matches, and every
+    best-scoring service must agree on one prefix."""
+    scored = [(_score(lrel, sl_ops[s.key]), s) for s in sls]
+    scored = [(n, s) for n, s in scored if n >= MIN_STOPLIGHT_MATCHES]
+    if not scored:
+        return None, None
+    top = max(n for n, _ in scored)
+    tops = [s for n, s in scored if n == top]
+    prefixes = {s.prefix for s in tops if s.prefix is not None}
+    if len(prefixes) != 1:
+        return None, None
+    pfx = next(iter(prefixes))
+    return pfx, sorted(s.name for s in tops if s.prefix == pfx)[0]
+
+
+def learn_prefixes(lives: list[Source], sls: list[Source]):
     """Gateway prefix per live service, plus a prefix per Stoplight service.
 
-    Evidence, in order of authority: the live YAML's own `servers` url, the
-    Stoplight service whose operations match (same method + normalised
-    service-relative path, confirmed by operationId/summary), and operations
-    already present in the baseline. Two agreeing sources = `matched`; one
-    declared source = `declared`; disagreement = `conflict` (not placed)."""
+    The baseline spec is deliberately NOT an input: it is the thing under test,
+    so using it as evidence would make the output depend on what it is compared
+    with. Evidence is only the two live sources:
+
+    - the live YAML's own `servers[0].url` is authoritative;
+    - a Stoplight service corroborates it when several non-trivial operations
+      (never a bare `/`) match and its prefix is the same -> `matched`;
+    - if Stoplight matches strongly but names a DIFFERENT prefix, the live
+      prefix is still used, flagged `conflict`, and reported for a human;
+    - with no usable live prefix, a strong Stoplight match supplies one;
+      otherwise the service is `unknown` and its operations stay unplaced."""
     sl_ops = {s.key: _rel_map(s) for s in sls}
     info: dict[str, dict] = {}
     for L in lives:
-        lrel = _rel_map(L)
         lops = [(m, p or "/") for p, m, _, _ in iter_ops(L.doc)]
-        scored = []
-        for s in sls:
-            n, b = _score(lrel, sl_ops[s.key])
-            if n and (n >= 2 or b >= 1):
-                scored.append((n + b, s, n, b))
-        sp = sname = None
-        strong = False
-        if scored:
-            top = max(x[0] for x in scored)
-            tops = [x for x in scored if x[0] == top]
-            pfx = {x[1].prefix for x in tops if x[1].prefix is not None}
-            if len(pfx) == 1:
-                sp = next(iter(pfx))
-                best = sorted((x for x in tops if x[1].prefix == sp), key=lambda x: x[1].name)[0]
-                sname, strong = best[1].name, (best[3] >= 1 or best[2] >= 3)
-
-        def hits(p):
-            if p is None:
-                return 0
-            return sum(1 for m, p0 in lops if (m.upper(), norm_path(join_path(p, p0))) in baseline_keys)
-
+        sp, sname = _stoplight_prefix_for(_rel_map(L), sls, sl_ops)
         declared = L.prefix
         prefix, conf, ev, note = None, "unknown", [], ""
         if declared is not None and sp is not None and declared == sp:
             prefix, conf, ev = declared, "matched", ["live-servers", "stoplight"]
-            if hits(declared):
-                ev.append("baseline")
         elif declared is not None and sp is not None:
-            hd, hs = hits(declared), hits(sp)
-            if not strong:
-                prefix, conf = declared, ("matched" if hd else "declared")
-                ev = ["live-servers"] + (["baseline"] if hd else [])
-                note = f"weak Stoplight match ({sname!r}) suggests {sp!r}; ignored"
-            elif hd > hs:
-                prefix, conf, ev = declared, "matched", ["live-servers", "baseline"]
-                note = f"Stoplight {sname!r} says {sp!r}; baseline confirms {declared!r}"
-            elif hs > hd:
-                prefix, conf, ev = sp, "matched", ["stoplight", "baseline"]
-                note = f"live servers say {declared!r}; baseline confirms {sp!r}"
-            else:
-                conf = "conflict"
-                note = f"live servers say {declared!r}, Stoplight {sname!r} says {sp!r}"
+            prefix, conf, ev = declared, "conflict", ["live-servers"]
+            note = (f"placed at the live prefix {declared!r}, but Stoplight "
+                    f"{sname!r} matches several operations at {sp!r}; needs a human check")
         elif declared is not None:
-            hd = hits(declared)
-            prefix, conf = declared, ("matched" if hd else "declared")
-            ev = ["live-servers"] + (["baseline"] if hd else [])
+            prefix, conf, ev = declared, "declared", ["live-servers"]
         elif sp is not None:
-            hs = hits(sp)
-            if strong or hs:
-                prefix, conf, ev = sp, "matched", ["stoplight"] + (["baseline"] if hs else [])
-            else:
-                note = f"weak Stoplight match ({sname!r}) suggests {sp!r}; not trusted"
+            prefix, conf, ev = sp, "matched", ["stoplight"]
         for n in L.notes:
             note = (note + "; " if note else "") + n
         info[L.key] = {"service": L.name, "origin": L.origin, "prefix": prefix, "confidence": conf,
@@ -1000,21 +981,17 @@ def learn_prefixes(lives: list[Source], sls: list[Source], baseline_keys: set):
                        "stoplight_service": sname, "note": note, "operations": len(lops)}
 
     # Stoplight services whose description gave no prefix borrow it from the
-    # live service they match.
+    # live service they match (same strict rule).
     sl_pref: dict[str, tuple] = {}
+    placed = [L for L in lives if info[L.key]["prefix"] is not None]
     for s in sls:
         if s.prefix is not None:
             sl_pref[s.key] = (s.prefix, s.prefix_src)
             continue
-        best = []
-        for L in lives:
-            if info[L.key]["prefix"] is None:
-                continue
-            n, b = _score(_rel_map(L), sl_ops[s.key])
-            if n and (b >= 1 or n >= 3):
-                best.append((n + b, info[L.key]["prefix"]))
-        top = max((x[0] for x in best), default=0)
-        pfx = {p for sc, p in best if sc == top}
+        scored = [(_score(_rel_map(L), sl_ops[s.key]), info[L.key]["prefix"]) for L in placed]
+        scored = [(n, p) for n, p in scored if n >= MIN_STOPLIGHT_MATCHES]
+        top = max((n for n, _ in scored), default=0)
+        pfx = {p for n, p in scored if n == top}
         sl_pref[s.key] = (next(iter(pfx)), "matched-live") if len(pfx) == 1 else (None, "")
     return info, sl_pref
 
@@ -1031,7 +1008,7 @@ async def probe_prefixes(cfg, info: dict, lives: list[Source]) -> None:
     async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}, follow_redirects=False) as client:
         for key in sorted(info):
             i = info[key]
-            if i["prefix"] is None or i["confidence"] != "declared":
+            if i["prefix"] is None or i["confidence"] not in ("declared", "conflict"):
                 continue
             ops = sorted((m != "get", p) for p, m, _, _ in iter_ops(by_key[key].doc))[:3]
             results = []
@@ -1042,7 +1019,8 @@ async def probe_prefixes(cfg, info: dict, lives: list[Source]) -> None:
                 await asyncio.sleep(PROBE_DELAY)
             i["probe"] = results
             if any(c in (400, 401, 403, 405) or 200 <= c < 300 for c in results):
-                i["confidence"] = "probed"
+                if i["confidence"] == "declared":
+                    i["confidence"] = "probed"
                 i["evidence"].append("probe")
             elif results and all(c == 404 for c in results):
                 i["probe_failed"] = True
@@ -1168,6 +1146,76 @@ def _diff_paths(a, b, path="", out=None, limit=8):
     elif a != b:
         out.append(f"~{path or '/'}")
     return out[:limit]
+
+
+def _schema_diff(a, b, path="", out=None):
+    """Every difference between two schemas as (kind, path, old, new); kind is
+    add / remove / change."""
+    out = [] if out is None else out
+    if isinstance(a, dict) and isinstance(b, dict):
+        for k in sorted(set(a) | set(b)):
+            if k not in a:
+                out.append(("add", f"{path}/{k}", None, b[k]))
+            elif k not in b:
+                out.append(("remove", f"{path}/{k}", a[k], None))
+            else:
+                _schema_diff(a[k], b[k], f"{path}/{k}", out)
+    elif a != b:
+        out.append(("change", path or "/", a, b))
+    return out
+
+
+def classify_change(old: dict, new: dict, changes: dict) -> list[str]:
+    """Reasons a change would break an existing caller; empty means additive.
+
+    Breaking: removed parameter, a parameter or request field that became
+    required, a removed enum value on input, a type change, a removed field,
+    a response field that is no longer guaranteed, or a change of auth."""
+    why: list[str] = []
+    ps = changes.get("parameters", {})
+    for k in ps.get("removed", []):
+        # an optional header nobody needs to send is not worth breaking a build over
+        if not (k.startswith("header:") and not old["required"].get(f"param/{k}")):
+            why.append(f"removed parameter {k}")
+    for k in ps.get("modified", []):
+        diffs = _schema_diff(old["parameters"][k], new["parameters"][k])
+        if any(kind == "change" and p.endswith("/type") for kind, p, _, _ in diffs):
+            why.append(f"type change on parameter {k}")
+    for loc, v in changes.get("enums", {}).items():
+        if v.get("removed") and loc.startswith(("param/", "request/")) and new["enums"].get(loc):
+            why.append(f"removed enum value(s) {v['removed']} on {loc}")
+    for loc, v in changes.get("required", {}).items():
+        inbound = loc.startswith(("param/", "request/"))
+        if not inbound and not loc.startswith("response/2"):
+            continue                              # error-body shapes do not break callers
+        if "added" in v or "removed" in v:
+            if inbound and v.get("added"):
+                why.append(f"new required field(s) {v['added']} on {loc}")
+            if not inbound and v.get("removed"):
+                why.append(f"response field(s) {v['removed']} no longer required on {loc}")
+        elif inbound and not v.get("from") and v.get("to"):
+            why.append(f"{loc} is now required")
+        elif not inbound and v.get("from") and not v.get("to"):
+            why.append(f"{loc} is no longer guaranteed")
+    for cat, label in (("request", "request"), ("responses", "response")):
+        for key in sorted(set(old[cat]) | set(new[cat])):
+            if old[cat].get(key) == new[cat].get(key):
+                continue
+            if cat == "responses" and not key.startswith("2"):
+                continue                          # only the success shape can break a caller
+            if key not in new[cat]:
+                why.append(f"removed {label} body {key}")
+                continue
+            for kind, p, was, now in _schema_diff(old[cat].get(key), new[cat][key]):
+                if isinstance(was, dict) and "$unresolved" in was:
+                    continue                      # the old side was itself broken
+                if kind == "remove" and p.rsplit("/", 2)[-2:-1] == ["properties"]:
+                    why.append(f"removed {label} field {key}{p}")      # a property, not a constraint
+                elif kind == "change" and p.endswith("/type") and isinstance(was, str) and isinstance(now, str):
+                    why.append(f"type change at {label} {key}{p}")
+    if "auth" in changes:
+        why.append("authentication changed")
+    return why
 
 
 def compare_facts(old: dict, new: dict) -> dict:
@@ -1364,7 +1412,7 @@ def build_spec(lives, extras, sls, overlays, history, info, sl_pref, run_date) -
             new["x-source"] = "overlay"
             if prior:
                 new["x-overlay-source"] = prior
-            if nk in merged and merged[nk]["source"] != "overlay":
+            if nk in merged and merged[nk]["source"] != "overlay" and new.get("x-overlay-keep") is not True:
                 overlay_covered.append({"key": okey(m, path), "covered_by": merged[nk]["source"],
                                         "overlay_file": s.file})
             merged[nk] = {"path": path, "method": m, "op": new, "source": "overlay",
@@ -1582,7 +1630,7 @@ def update_history(old: dict, live_sigs: dict, run_date: str) -> dict:
         if k not in present and rec.get("live_seen"):
             rec["missing_runs"] = rec.get("missing_runs", 0) + 1
     runs = [r for r in (old.get("runs") or []) if r != run_date] + [run_date]
-    return {"version": 1, "runs": runs[-52:], "ops": ops}
+    return {"version": HISTORY_VERSION, "runs": runs[-52:], "ops": ops}
 
 
 def _index_doc(doc: dict) -> dict:
@@ -1630,7 +1678,8 @@ def compute_drift(res: dict, baseline: dict | None, new_hist: dict, used: list) 
     doc, merged = res["doc"], res["merged"]
     bidx = _index_doc(baseline) if baseline else {}
     drift: dict = {"added": [], "changed": [], "deprecated": [], "removed_candidate": [],
-                   "baseline_only": [], "prefix_unknown": [], "stoplight_only": []}
+                   "baseline_only": [], "prefix_unknown": [], "prefix_conflict": [],
+                   "stoplight_only": []}
 
     def rec(nk, extra=None):
         m = merged[nk]
@@ -1647,14 +1696,20 @@ def compute_drift(res: dict, baseline: dict | None, new_hist: dict, used: list) 
             if baseline and m["source"] != "overlay":
                 drift["added"].append(rec(nk))
         elif m["source"] != "overlay":
-            ch = compare_facts(op_facts(baseline, base[2], base[3]), op_facts(doc, op))
+            of, nf = op_facts(baseline, base[2], base[3]), op_facts(doc, op)
+            ch = compare_facts(of, nf)
             if ch:
-                drift["changed"].append(rec(nk, {"baseline_path": base[0], "changes": ch}))
+                why = classify_change(of, nf, ch)
+                drift["changed"].append(rec(nk, {
+                    "baseline_path": base[0], "changes": ch,
+                    "severity": "breaking" if why else "additive", "breaking_reasons": why[:10]}))
         if op.get("deprecated") is True:
             newly = bool(base) and base[2].get("deprecated") is not True
             drift["deprecated"].append(rec(nk, {"newly_deprecated": newly}))
         if m["source"] == "stoplight":
             drift["stoplight_only"].append(rec(nk))
+        if m["conf"] == "conflict":
+            drift["prefix_conflict"].append(rec(nk))
     for nk in sorted(bidx):
         if nk not in merged:
             path, meth, op, _ = bidx[nk]
@@ -1677,13 +1732,20 @@ def compute_drift(res: dict, baseline: dict | None, new_hist: dict, used: list) 
         for cat in ("changed", "removed_candidate", "baseline_only"):
             for r in drift[cat]:
                 if is_used(r["key"]):
-                    hits.append({"key": r["key"], "category": cat})
+                    hits.append({"key": r["key"], "category": cat,
+                                 "severity": r.get("severity", "breaking")})
         dep = [r["key"] for r in drift["deprecated"] if is_used(r["key"])]
-    drift["used_endpoints"] = {"checked": len(used), "affected": hits, "deprecated_in_use": dep}
+    drift["used_endpoints"] = {
+        "checked": len(used), "affected": hits, "deprecated_in_use": dep,
+        "breaking": [h for h in hits if h["severity"] == "breaking"],
+        "additive": [h for h in hits if h["severity"] != "breaking"]}
     drift["summary"] = {k: len(v) for k, v in drift.items() if isinstance(v, list)}
-    drift["summary"].update(overlay_applied=len(res["overlay_applied"]),
-                            overlay_now_covered=len(res["overlay_covered"]),
-                            used_endpoints_affected=len(hits))
+    drift["summary"].update(
+        changed_breaking=sum(1 for r in drift["changed"] if r["severity"] == "breaking"),
+        changed_additive=sum(1 for r in drift["changed"] if r["severity"] != "breaking"),
+        overlay_applied=len(res["overlay_applied"]), overlay_now_covered=len(res["overlay_covered"]),
+        used_endpoints_breaking=len(drift["used_endpoints"]["breaking"]),
+        used_endpoints_additive=len(drift["used_endpoints"]["additive"]))
     drift["baseline_operations"] = len(bidx) if baseline else None
     return drift
 
@@ -1737,10 +1799,14 @@ def write_report(path: Path, drift: dict, manifest: dict, run_date: str,
          f"- **Validation:** {manifest['validation']['summary']}", "", "## Needs attention", ""]
     ue = drift["used_endpoints"]
     if ue["checked"]:
-        L += [f"### Endpoints you use that drifted ({len(ue['affected'])} operations; "
-              f"{ue['checked']} entries checked)", ""]
-        L += _table([[a["key"], a["category"]] for a in ue["affected"]], ["Endpoint", "Drift"]) \
-            if ue["affected"] else ["None."]
+        L += [f"### Endpoints you use with BREAKING drift ({len(ue['breaking'])} operations; "
+              f"{ue['checked']} entries checked)", "",
+              "These make the run exit with code 10.", ""]
+        L += _table([[a["key"], a["category"]] for a in ue["breaking"]], ["Endpoint", "Drift"]) \
+            if ue["breaking"] else ["None."]
+        L += ["", f"Additive drift on endpoints you use ({len(ue['additive'])}, informational): "
+              + (", ".join(f"`{a['key']}`" for a in ue["additive"][:15])
+                 + (" ..." if len(ue["additive"]) > 15 else "") if ue["additive"] else "none.")]
         if ue["deprecated_in_use"]:
             L += ["", "Deprecated but in use: " + ", ".join(f"`{k}`" for k in ue["deprecated_in_use"])]
         L.append("")
@@ -1752,16 +1818,18 @@ def write_report(path: Path, drift: dict, manifest: dict, run_date: str,
           "No source and no overlay entry provides these. Add them to the overlay or confirm they are gone.", ""]
     L += _table([[r["key"], r["x-source"] or ""] for r in drift["baseline_only"]],
                 ["Operation", "Baseline x-source"]) if drift["baseline_only"] else ["None."]
-    L += ["", f"### Changed ({s['changed']}) - riskiest first", ""]
-    ranked = sorted(drift["changed"], key=lambda r: (-_risk(r["changes"]), r["key"]))
-    L += _table([[r["key"], r["source"], _brief_changes(r["changes"])] for r in ranked],
-                ["Operation", "Source", "What changed"]) if drift["changed"] else ["None."]
+    L += ["", f"### Changed ({s['changed']}: {s['changed_breaking']} breaking, "
+              f"{s['changed_additive']} additive) - breaking first", ""]
+    ranked = sorted(drift["changed"], key=lambda r: (r["severity"] != "breaking", -_risk(r["changes"]), r["key"]))
+    L += _table([[r["key"], r["severity"], _brief_changes(r["changes"])] for r in ranked],
+                ["Operation", "Severity", "What changed"]) if drift["changed"] else ["None."]
     L += ["", f"### Deprecated ({s['deprecated']})", ""]
     L += _table([[r["key"], "new" if r["newly_deprecated"] else ""] for r in drift["deprecated"]],
                 ["Operation", "Newly deprecated"]) if drift["deprecated"] else ["None."]
     bad = {k: v for k, v in manifest["prefix_map"].items()
            if v["confidence"] in ("conflict", "unknown") or v.get("probe_failed")}
-    L += ["", f"### Prefix problems ({len(bad)} services, {s['prefix_unknown']} operations not placed)", ""]
+    L += ["", f"### Prefix problems ({len(bad)} services; {s['prefix_unknown']} operations not placed, "
+              f"{s['prefix_conflict']} placed at a disputed prefix)", ""]
     L += _table([[k, "not routable" if v.get("probe_failed") else v["confidence"], v["note"] or ""]
                  for k, v in sorted(bad.items())],
                 ["Service", "State", "Note"]) if bad else ["None."]
@@ -1889,6 +1957,10 @@ def run(cfg) -> int:
 def _run(cfg) -> int:
     if not cfg.skip_validation:
         _load_validator()          # fail before fetching anything if it is missing
+    if cfg.auth_token_env and not cfg.from_raw:
+        cfg.auth_token = os.environ.get(cfg.auth_token_env, "").strip()
+        if not cfg.auth_token:
+            raise FatalError(f"--auth-token-env {cfg.auth_token_env}: that environment variable is not set or empty")
     out = abs_path(cfg.out_dir)
     sweep_tmp(out)
     raw_dir = out / "raw"
@@ -1916,10 +1988,13 @@ def _run(cfg) -> int:
     baseline = _read_doc(abs_path(cfg.baseline)) if cfg.baseline else None
     hist_path = out / "history.json"
     history = json.loads(read_input_text(hist_path, "history")) if hist_path.is_file() else {}
+    if history and history.get("version") != HISTORY_VERSION:
+        notes.append("history.json was written before the placement fix and is ignored; "
+                     "a fresh history starts with this run")
+        history = {}
     run_date = cfg.run_date or today()
-    bkeys = set(_index_doc(baseline)) if baseline else set()
 
-    info, sl_pref = learn_prefixes(lives + extras, sls, bkeys)
+    info, sl_pref = learn_prefixes(lives + extras, sls)
     if cfg.probe:
         print("[api-spec] probing declared prefixes (read-only, unauthenticated)")
         asyncio.run(probe_prefixes(cfg, info, lives + extras))
@@ -1949,7 +2024,7 @@ def _run(cfg) -> int:
     for n in notes:
         print(f"[api-spec] note: {n}")
     print(f"[api-spec] report: {report}" + (" (dry run: nothing else written)" if cfg.dry_run else ""))
-    return EXIT_USED_DRIFT if drift["used_endpoints"]["affected"] else 0
+    return EXIT_USED_DRIFT if drift["used_endpoints"]["breaking"] else 0
 
 
 def add_arguments(ap: argparse.ArgumentParser) -> None:
@@ -1965,6 +2040,9 @@ def add_arguments(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--from-raw", metavar="DIR", help="Rebuild from an earlier raw/ directory, no network")
     g.add_argument("--probe", action="store_true",
                    help="Confirm declared prefixes with a few unauthenticated GETs (off by default)")
+    g.add_argument("--auth-token-env", metavar="VAR",
+                   help="Name of an environment variable holding a tenant bearer token. Opt-in: "
+                        "used only to fetch the extra services that need a login; never stored or printed")
     g.add_argument("--run-date", help="Pin the sync date (YYYY-MM-DD), e.g. to reproduce a run")
     g.add_argument("--skip-validation", action="store_true",
                    help="Do not run the OpenAPI 3.0 validator on the merged spec (it runs by default)")
@@ -1985,6 +2063,7 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
         dry_run=getattr(args, "dry_run", False), from_raw=getattr(args, "from_raw", None),
         probe=getattr(args, "probe", False), run_date=getattr(args, "run_date", None),
         skip_validation=getattr(args, "skip_validation", False),
+        auth_token_env=getattr(args, "auth_token_env", None), auth_token=None,
         concurrency=API_CONCURRENCY, timeout=API_TIMEOUT, retries=API_RETRIES,
         allowed_hosts={(urlparse(base).hostname or "").lower(), "stoplight.io", "checkmarx.stoplight.io"})
 

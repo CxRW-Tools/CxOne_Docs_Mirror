@@ -26,6 +26,8 @@ def live_doc(extra_paths=None, enum=("Queued", "Running")):
             "responses": {200: {"description": "ok", "content": {"application/json": {
                 "schema": {"$ref": "#/components/schemas/Scan"}}}}}}},
         "/{id}": {"get": {"responses": {"200": {"description": "ok"}}}},
+        "/items": {"get": {"responses": {"200": {"description": "ok"}}}},
+        "/export": {"get": {"responses": {"200": {"description": "ok"}}}},
     }
     paths.update(extra_paths or {})
     return A._strkeys({
@@ -45,6 +47,8 @@ def sl_doc():
             "/": {"get": {"operationId": "x", "summary": "Retrieve scans", "description": "Stoplight prose",
                           "x-stoplight": {"id": "abc"}, "responses": {"200": {"description": "ok"}}}},
             "/{id}": {"get": {"summary": "One scan", "responses": {"200": {"description": "ok"}}}},
+            "/items": {"get": {"summary": "Items", "responses": {"200": {"description": "ok"}}}},
+            "/export": {"get": {"summary": "Export", "responses": {"200": {"description": "ok"}}}},
             "/legacy": {"get": {"summary": "Only in Stoplight", "responses": {"200": {"description": "ok"}}}},
         }}
 
@@ -59,9 +63,8 @@ def src(origin, key, doc, name=None):
     return s
 
 
-def build(lives, sls, overlays=(), baseline=None, history=None):
-    bkeys = set(A._index_doc(baseline)) if baseline else set()
-    info, sl_pref = A.learn_prefixes(lives, sls, bkeys)
+def build(lives, sls, overlays=(), history=None):
+    info, sl_pref = A.learn_prefixes(lives, sls)
     return A.build_spec(lives, [], sls, list(overlays), history or {}, info, sl_pref, DATE)
 
 
@@ -110,33 +113,30 @@ class Helpers(unittest.TestCase):
 
 class Prefixes(unittest.TestCase):
     def test_agreeing_sources_are_matched(self):
-        info, _ = A.learn_prefixes([src("live", "SCANS", live_doc())], [src("stoplight", "s1", sl_doc())], set())
+        info, _ = A.learn_prefixes([src("live", "SCANS", live_doc())], [src("stoplight", "s1", sl_doc())])
         self.assertEqual(info["SCANS"]["prefix"], "/api/scans")
         self.assertEqual(info["SCANS"]["confidence"], "matched")
 
     def test_declared_only(self):
-        info, _ = A.learn_prefixes([src("live", "SCANS", live_doc())], [], set())
+        info, _ = A.learn_prefixes([src("live", "SCANS", live_doc())], [])
         self.assertEqual(info["SCANS"]["confidence"], "declared")
 
-    def test_baseline_confirms_declared(self):
-        base = {"paths": {"/api/scans": {"get": {}}}}
-        info, _ = A.learn_prefixes([src("live", "SCANS", live_doc())], [], set(A._index_doc(base)))
-        self.assertEqual(info["SCANS"]["confidence"], "matched")
-        self.assertIn("baseline", info["SCANS"]["evidence"])
+    def test_baseline_is_not_an_input(self):
+        import inspect
+        self.assertEqual(list(inspect.signature(A.learn_prefixes).parameters), ["lives", "sls"])
 
     def test_disagreement_is_flagged_not_guessed(self):
         doc = live_doc()
         doc["servers"] = [{"url": "/api/other"}]
-        sl = sl_doc()
-        sl["paths"]["/"]["get"]["summary"] = "live summary"     # same summary = strong match
-        info, _ = A.learn_prefixes([src("live", "SCANS", doc)], [src("stoplight", "s1", sl)], set())
+        info, _ = A.learn_prefixes([src("live", "SCANS", doc)], [src("stoplight", "s1", sl_doc())])
         self.assertEqual(info["SCANS"]["confidence"], "conflict")
-        self.assertIsNone(info["SCANS"]["prefix"])
+        self.assertEqual(info["SCANS"]["prefix"], "/api/other")    # the live prefix wins, flagged for a human
+        self.assertEqual(info["SCANS"]["stoplight"], "/api/scans")
 
     def test_unusable_server_means_unknown(self):
         doc = live_doc()
         doc["servers"] = [{"url": "REPOS"}]
-        info, _ = A.learn_prefixes([src("live", "X", doc)], [], set())
+        info, _ = A.learn_prefixes([src("live", "X", doc)], [])
         self.assertEqual(info["X"]["confidence"], "unknown")
 
 
@@ -226,7 +226,7 @@ class Merge(unittest.TestCase):
         d["servers"] = [{"url": "REPOS"}]
         res = build([src("live", "BAD", d)], [])
         self.assertEqual(res["doc"]["paths"], {})
-        self.assertEqual(len(res["live_unplaced"]), 2)
+        self.assertEqual(len(res["live_unplaced"]), 4)
 
 
 class Overlay(unittest.TestCase):
@@ -310,10 +310,10 @@ class Drift(unittest.TestCase):
         res = build([src("live", "SCANS", live_doc())], [])
         hist = A.update_history({}, res["live_sigs"], "2026-01-01")
         same = [src("live", "SCANS", live_doc())]
-        later = A.build_spec(same, [], [], [], hist, *A.learn_prefixes(same, [], set()), "2026-02-01")
+        later = A.build_spec(same, [], [], [], hist, *A.learn_prefixes(same, []), "2026-02-01")
         self.assertEqual(later["doc"]["paths"]["/api/scans"]["get"]["x-live-verified"], "2026-01-01")
         new = [src("live", "SCANS", live_doc(enum=("Queued",)))]
-        changed = A.build_spec(new, [], [], [], hist, *A.learn_prefixes(new, [], set()), "2026-02-01")
+        changed = A.build_spec(new, [], [], [], hist, *A.learn_prefixes(new, []), "2026-02-01")
         self.assertEqual(changed["doc"]["paths"]["/api/scans"]["get"]["x-live-verified"], "2026-02-01")
 
 
