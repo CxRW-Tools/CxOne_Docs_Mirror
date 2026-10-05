@@ -18,9 +18,9 @@ Run it through cx_docs_mirror.py (`--stage api-spec`) or directly:
 
     python cx_api_spec.py --baseline path/to/cxone_openapi.json
     python cx_api_spec.py --dry-run          # fetch + report only
-    python cx_api_spec.py --from-raw api-spec/raw
+    python cx_api_spec.py --from-raw api/raw
 
-Outputs (all inside --api-out, default ./api-spec):
+Outputs (all inside --api-out, default ./api; the README describes each file):
     raw/                      downloads kept for traceability
       provenance.json         source URL, fetch time, SHA-256 per file
       live/…  stoplight/…
@@ -59,8 +59,8 @@ API_BASE_URL = "https://ast.checkmarx.net"      # regional tenant root for the l
 # Services missing from the catalog that serve their own spec at
 # {base_url}/api/{service}/openapi.json (currently need a login: reported, skipped).
 API_EXTRA_SERVICES = ["ai-triage", "remediation"]
-API_OUT_DIR = "api-spec"
-API_OVERLAY_DIR = "api-overlay"                 # optional hand-maintained operations
+API_OUT_DIR = "api"                             # everything this stage writes lives here
+API_OVERLAY_DIR = "api/overlay"                 # optional hand-maintained operations (input, not output)
 
 STOPLIGHT_HOST = "https://checkmarx.stoplight.io"
 STOPLIGHT_WORKSPACE_ID = "d2s6NTE3NDY"          # workspace "checkmarx"
@@ -147,11 +147,28 @@ def today() -> str:
     return time.strftime("%Y-%m-%d")
 
 
+def write_atomic(path: Path, text: str) -> None:
+    """Write via a sibling .tmp file, then rename, so an interrupted run never
+    leaves a half-written output; the .tmp file is always removed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8", newline="\n")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def sweep_tmp(root: Path) -> None:
+    """Delete .tmp files left behind by a run that was killed mid-write."""
+    if root.is_dir():
+        for f in root.rglob("*.tmp"):
+            f.unlink(missing_ok=True)
+
+
 def dump_json(path: Path, obj) -> None:
     """Deterministic JSON: sorted keys, 2-space indent, trailing newline."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-                    encoding="utf-8", newline="\n")
+    write_atomic(path, json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
 
 
 def iter_ops(doc: dict):
@@ -217,7 +234,12 @@ class RawSet:
             if p.exists() and p.read_bytes() == blob:
                 continue
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(blob)
+            tmp = p.with_name(p.name + ".tmp")
+            try:
+                tmp.write_bytes(blob)
+                os.replace(tmp, p)
+            finally:
+                tmp.unlink(missing_ok=True)
         dump_json(raw_dir / "provenance.json", self.entries)
 
     @classmethod
@@ -1764,8 +1786,7 @@ def write_report(path: Path, drift: dict, manifest: dict, run_date: str,
     L += ["", "### Fetch and merge problems", ""]
     L += [f"- {i}" for i in items] if items else ["None."]
     L.append("")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(L), encoding="utf-8", newline="\n")
+    write_atomic(path, "\n".join(L))
 
 
 def _load_validator():
@@ -1869,6 +1890,7 @@ def _run(cfg) -> int:
     if not cfg.skip_validation:
         _load_validator()          # fail before fetching anything if it is missing
     out = abs_path(cfg.out_dir)
+    sweep_tmp(out)
     raw_dir = out / "raw"
     notes: list[str] = []
     fetched = False
