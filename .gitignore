@@ -7,6 +7,9 @@ manifest.json
 mirror-state.json
 failures.log
 
+# API spec stage output (raw downloads, merged spec, drift, history)
+api-spec/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
