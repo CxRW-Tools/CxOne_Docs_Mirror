@@ -101,6 +101,19 @@ By default do everything. If the user limits the scope ("just the API spec", "do
    - Enrichment: pages with a record, rejected after the retry (most common reasons), approximate tokens.
    - Which files to load: `docs/...-reference.md` first, then the guide; `api/cxone_openapi.json` for endpoints.
 
+10. **Deliver.** Always the last step, after the report, on every run that produced output (including a run where
+    the user declined enrichment). Send the deliverables to the user with `SendUserFile` (status `proactive`),
+    one call, only the files that exist on disk for this run:
+    - `api/cxone_openapi.json`
+    - `api/API-SPEC-REPORT.md`
+    - `docs/checkmarx-one-docs-<date>-reference.md`
+    - `docs/checkmarx-one-docs-<date>.md`
+    - `docs/checkmarx-one-docs-<date>-companion.jsonl`
+
+    Use `<date>` from the guide's filename. Do not send the other `docs/` files or the `enrich-work/`, `enrich-cache/`
+    or `pages/` folders; they are working files. If the run stopped before a file was built, leave it out and say so
+    in the report.
+
 ## Notes
 
 - Records are cached by page text, prompt version and (for variants) the canonical page's text, in
