@@ -494,7 +494,7 @@ async def _fetch_sibling_refs(client, sem, cfg, raw: RawSet, notes: list[str], r
         for rel, blob in list(raw.blobs.items()):
             if rel.startswith("stoplight/") and rel.endswith((".yaml", ".yml")):
                 for m in _REF_FILE.finditer(blob.decode("utf-8", "replace")):
-                    name = unquote(m.group(1))
+                    name = Path(unquote(m.group(1))).name      # `../X.yaml` and `./X.yaml` are both just X.yaml
                     if name not in known and name not in tried:
                         wanted.add(name)
         if not wanted:
@@ -1356,7 +1356,8 @@ def _collect(srcs, prefix_of):
                 unplaced.append({"service": s.name, "origin": s.origin, "method": m.upper(),
                                  "service_path": rel, "summary": op.get("summary") or ""})
                 continue
-            full = join_path(pfx, rel)
+            # some specs already write the full public path under their own server url
+            full = rel if (pfx and (rel == pfx or rel.startswith(pfx + "/"))) else join_path(pfx, rel)
             nk = nkey(m, full)
             if nk in table:
                 collisions.append({"key": okey(m, full), "kept": table[nk].src.name, "dropped": s.name})

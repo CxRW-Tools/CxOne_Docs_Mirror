@@ -114,6 +114,22 @@ class ShrinkGuard(unittest.TestCase):
         self.assertTrue(A.build_cfg(ap.parse_args(["--allow-shrink"])).allow_shrink)
 
 
+class PathsThatAlreadyCarryTheirPrefix(unittest.TestCase):
+    def build(self, server, paths):
+        live = A.Source("live", "F", "Feedback", "f.yaml", "f.yaml", {"paths": paths}, server, "x")
+        info, sl = A.learn_prefixes([live], [])
+        return A.build_spec([live], [], [], [], {}, info, sl, "2026-01-01")["doc"]["paths"]
+
+    def test_full_public_paths_are_not_prefixed_twice(self):
+        got = self.build("/api/feedback-app", {"/api/feedback-app/v2/profiles": {"get": op("a")},
+                                               "/v3/profiles": {"get": op("b")}})
+        self.assertEqual(sorted(got), ["/api/feedback-app/v2/profiles", "/api/feedback-app/v3/profiles"])
+
+    def test_a_path_that_merely_looks_similar_is_still_prefixed(self):
+        got = self.build("/api/x", {"/api/xylophone": {"get": op("a")}, "/api/x": {"get": op("b")}})
+        self.assertEqual(sorted(got), ["/api/x", "/api/x/api/xylophone"])
+
+
 class ResponseFieldsDropped(unittest.TestCase):
     def live(self):
         return A.Source("live", "L", "L", "l.yaml", "l.yaml",
@@ -188,6 +204,11 @@ class SiblingRefs(unittest.TestCase):
                        {"paths": {"/only-in-sibling": {"get": op("x")}}, "components": {}})
         res = self.build("./sibling.yaml#/components/parameters/p", [sib])
         self.assertNotIn("/api/x/only-in-sibling", res["doc"]["paths"])
+
+    def test_relative_prefixes_are_reduced_to_the_file_name(self):
+        text = "$ref: '../AI-Supply-Chain-Results-Service.yaml#/components/x'"
+        (m,) = list(A._REF_FILE.finditer(text))
+        self.assertEqual(Path(m.group(1)).name, "AI-Supply-Chain-Results-Service.yaml")
 
     def test_ref_regex_finds_yaml_refs_only(self):
         text = "a:\n  $ref: './sastResults_copy.yaml#/components/x'\n  b: [Scans.yaml/paths/~1x](link)\n" \

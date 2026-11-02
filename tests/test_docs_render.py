@@ -187,6 +187,19 @@ class Dedupe(unittest.TestCase):
         self.assertEqual((a["status"], a["duplicate_of"]), ("drop", b["file"]))
         self.assertEqual(b["aliases"], [a["file"]])
 
+    def test_same_topic_id_with_different_content_is_not_collapsed(self):
+        # Cursor / Windsurf / Kiro variants of one topic: real content, must all survive
+        a = rec("34965-474001-using-vs-code.html", "Using Developer Assist in VS Code", ["P"], nav=1, _text_key="vs")
+        b = rec("34965-474001-using-cursor-766055.html", "Using Developer Assist in Cursor", ["P"], nav=2, _text_key="cursor")
+        c = rec("34965-474001-using-cursor-copy.html", "Using Developer Assist in Cursor", ["P"], nav=3, _text_key="cursor")
+        index = {m["file"]: m for m in (a, b, c)}
+        self.assertEqual(D._dedupe(index), (1, 0))                 # only the true copy goes
+        live = D._live(index)
+        self.assertEqual(sorted(m["file"] for m in live), sorted([a["file"], b["file"]]))
+        D._assign_anchors(live)
+        self.assertEqual(len({m["anchor"] for m in live}), 2)       # anchors stay unique
+        self.assertEqual(a["anchor"], "p-474001")                   # the first keeps the plain anchor
+
     def test_earlier_nav_position_breaks_ties(self):
         a = rec("34965-7-x.html", "X", ["P", "B"], nav=20)
         b = rec("34965-7-y.html", "X", ["P", "A"], nav=3)

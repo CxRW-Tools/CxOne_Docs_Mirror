@@ -738,8 +738,26 @@ def _collapse(index: dict[str, dict], key_of, reason: str) -> int:
 def _dedupe(index: dict[str, dict]) -> tuple[int, int]:
     """(duplicate topic ids, identical-text duplicates). The topic id is the
     reliable key; identical visible text is the safety net."""
-    return (_collapse(index, lambda m: m["topic_id"], "duplicate-topic-id"),
+    # The same topic id can be published with different content per product
+    # (Cursor / Windsurf / Kiro variants), so an id alone is not enough to drop a page.
+    return (_collapse(index, lambda m: (m["topic_id"], m["_text_key"])
+                      if m["topic_id"] and m["_text_key"] else None, "duplicate-topic-id"),
             _collapse(index, lambda m: m["_text_key"], "duplicate"))
+
+
+def _assign_anchors(live: list[dict]) -> int:
+    """Anchors are `p-<topic id>`; when one topic id survives with different
+    content, the later variants get `-2`, `-3`... so every anchor stays unique."""
+    groups: dict[str, list[dict]] = {}
+    for m in live:
+        groups.setdefault(m["anchor"], []).append(m)
+    n = 0
+    for anchor, members in groups.items():
+        members.sort(key=_canonical_first)
+        for i, m in enumerate(members[1:], 2):
+            m["anchor"] = f"{anchor}-{i}"
+            n += 1
+    return n
 
 
 def _tag_parts(index: dict[str, dict], mode: str, patterns: list[str]) -> int:
@@ -784,6 +802,7 @@ def _assign_display_titles(live: list[dict]) -> int:
 def _build_records(index: dict[str, dict], cfg: SimpleNamespace):
     """Convert kept pages to Markdown -> (records, render stats)."""
     live = _live(index)
+    variants = _assign_anchors(live)
     disambiguated = _assign_display_titles(live)
     target = {m["file"]: {"anchor": m["anchor"], "part": m["part"]} for m in live}
     for m in index.values():                       # a link to an alias lands on the surviving page
@@ -799,6 +818,7 @@ def _build_records(index: dict[str, dict], cfg: SimpleNamespace):
             rec["markdown"] = render.to_markdown(meta["_section"], ctx)
         records.append(rec)
     ctx.stats["titles_disambiguated"] = disambiguated
+    ctx.stats["topic_variants"] = variants
     return records, ctx.stats
 
 
@@ -853,7 +873,8 @@ def stage_extract(cfg: SimpleNamespace) -> None:
           f"{rstats['callouts']} callouts, {rstats['tables_as_lists']} tables as lists, "
           f"{rstats['links_internal']} internal links -> anchors, {rstats['links_live_site']} -> live site, "
           f"images: {rstats['images_removed']} removed, {rstats['images_kept_as_text']} kept as text, "
-          f"{rstats['images_absolute']} absolute; {rstats['titles_disambiguated']} titles disambiguated")
+          f"{rstats['images_absolute']} absolute; {rstats['titles_disambiguated']} titles disambiguated, "
+          f"{rstats['topic_variants']} same-id variants kept")
     print(f"[extract] wrote {cfg.json_path}")
 
 
