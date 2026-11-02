@@ -63,7 +63,8 @@ from types import SimpleNamespace
 from urllib.parse import urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup
-from markdownify import markdownify as md
+
+import cx_docs_render as render
 
 # ===========================================================================
 # CONFIG  — edit these defaults; all are overridable via command-line flags.
@@ -115,6 +116,17 @@ TITLE_EXCLUDE_PATTERNS: list[str] = [
     r"content pack",
     r"\brs[- ]\d",
 ]
+
+# --- Output quality ---------------------------------------------------------
+IMAGES = "strip"           # strip (keep meaningful alt text) | absolute (docs.checkmarx.com URLs)
+# Pages under these breadcrumb names (or with this title) are API reference that
+# overlaps the API spec job; with API_REFERENCE = "separate" they get their own file.
+API_REFERENCE = "separate"  # separate | inline
+API_REFERENCE_CRUMBS: list[str] = [r"^Checkmarx One API Documentation$", r"REST API Reference$"]
+STALE_MONTHS = 18          # front-matter index of pages not modified for this long (0 = off)
+# Combine fails (exit 3, after writing) when a metric exceeds its limit; None = report only.
+QUALITY_LIMITS: dict[str, int | None] = {
+    "dead_links": 0, "broken_images": 0, "duplicate_ids": 0, "h6_headings": None}
 
 # --- Crawl tuning -----------------------------------------------------------
 CONCURRENCY = 8            # simultaneous HTTP requests
@@ -549,6 +561,10 @@ async def _mirror(cfg: SimpleNamespace) -> None:
             _process(u, p, client, cfg, out_dir, state, sem, stats, changes, failures, manifest)
             for u, p in items])
 
+    for position, (u, _) in enumerate(items):      # sidebar order, used to sort the combined document
+        if u in state:
+            state[u]["nav"] = position
+
     # Pages we tracked before that are no longer in the nav (skip when --max-pages
     # truncated the run, since then absence proves nothing).
     removed = []
@@ -595,26 +611,16 @@ def _breadcrumb(soup) -> list[str]:
     return out
 
 
-def _clean_body_md(section) -> str:
-    # Strip non-content cruft before conversion.
-    for el in section.find_all("a", class_="header-link"):
-        el.decompose()
-    for el in section.find_all("i", class_="fa"):
-        el.decompose()
-    for el in section.find_all(["script", "style"]):
-        el.decompose()
-    body = md(str(section), heading_style="ATX", bullets="-").strip()
-    body = re.sub(r"\n{3,}", "\n\n", body)
-    # Flatten useless in-page anchor links: [text](#frag) -> text
-    body = re.sub(r"\[([^\]]+)\]\(#[^)]*\)", r"\1", body)
-    return body
+def _section_text(section) -> str:
+    return " ".join(section.get_text(" ", strip=True).split())
 
 
-def _index_pages(files: list[Path]) -> dict[str, dict]:
+def _index_pages(files: list[Path], nav_by_file: dict | None = None) -> dict[str, dict]:
     """Parse every mirrored page into a metadata record keyed by file name.
 
     The page's BeautifulSoup <section> rides along under '_section' for the
     conversion pass; underscore keys are stripped before serialization."""
+    nav_by_file = nav_by_file or {}
     index: dict[str, dict] = {}
     for path in files:
         html = path.read_text(encoding="utf-8", errors="replace")
@@ -637,6 +643,10 @@ def _index_pages(files: list[Path]) -> dict[str, dict]:
             "modified": section.get("data-time-modified", "") if section else "",
             "links": sorted(set(links)),
             "has_content": section is not None,
+            "topic_id": render.topic_id(path.name),
+            "anchor": render.anchor_for(path.name),
+            "nav": nav_by_file.get(path.name),
+            "_text_key": digest(_section_text(section)) if section is not None else None,
             "_section": section,
         }
     return index
@@ -681,25 +691,115 @@ def _drop_by_title(index: dict[str, dict], patterns: list[str]) -> int:
     return dropped
 
 
-def _build_records(index: dict[str, dict]) -> tuple[list[dict], int]:
-    """Convert kept/rescued bodies to Markdown → (records, duplicates_dropped)."""
+def _drop_empty(index: dict[str, dict], images: str) -> int:
+    """Pages with no content render to nothing; drop them before links are resolved
+    so no link can point at a page that is not in the document."""
+    n = 0
+    for m in index.values():
+        if m["status"] in ("keep", "rescued") and m["has_content"] and render.is_empty(m["_section"], images):
+            m["status"], m["drop_reason"] = "drop", "empty"
+            n += 1
+    return n
+
+
+def _live(index: dict[str, dict]) -> list[dict]:
+    return [m for m in index.values() if m["status"] in ("keep", "rescued") and m["has_content"]]
+
+
+def _canonical_first(meta: dict):
+    """Sort key: the page that should survive a duplicate group sorts first.
+    The original slug beats a `...-<id>` re-publication under another parent;
+    then the earlier position in the site navigation; then the shallower path."""
+    nav = meta["nav"] if meta["nav"] is not None else 10 ** 9
+    return (render.is_reused_slug(meta["file"]), nav, len(meta["breadcrumb"]), meta["file"])
+
+
+def _collapse(index: dict[str, dict], key_of, reason: str) -> int:
+    """Keep one page per key; the rest are dropped and remembered as aliases so
+    links to them still resolve."""
+    groups: dict[str, list[dict]] = {}
+    for m in _live(index):
+        k = key_of(m)
+        if k:
+            groups.setdefault(k, []).append(m)
+    dropped = 0
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        members.sort(key=_canonical_first)
+        keep = members[0]
+        for m in members[1:]:
+            m["status"], m["drop_reason"], m["duplicate_of"] = "drop", reason, keep["file"]
+            keep.setdefault("aliases", []).append(m["file"])
+            dropped += 1
+    return dropped
+
+
+def _dedupe(index: dict[str, dict]) -> tuple[int, int]:
+    """(duplicate topic ids, identical-text duplicates). The topic id is the
+    reliable key; identical visible text is the safety net."""
+    return (_collapse(index, lambda m: m["topic_id"], "duplicate-topic-id"),
+            _collapse(index, lambda m: m["_text_key"], "duplicate"))
+
+
+def _tag_parts(index: dict[str, dict], mode: str, patterns: list[str]) -> int:
+    """Pages that are API reference get part='api' so combine can write them to
+    their own file; with mode 'inline' everything stays in the main document."""
+    rx = [re.compile(p, re.I) for p in patterns]
+    n = 0
+    for m in index.values():
+        m["part"] = "main"
+        if mode == "separate" and any(r.search(c) for r in rx for c in [*m["breadcrumb"], m["title"]]):
+            m["part"] = "api"
+            n += m["status"] in ("keep", "rescued")
+    return n
+
+
+def _assign_display_titles(live: list[dict]) -> int:
+    """Pages that share a title get the breadcrumb tail added: `Title (Parent)`."""
+    groups: dict[tuple, list[dict]] = {}
+    for m in live:
+        groups.setdefault((m["part"], m["title"].strip().lower()), []).append(m)
+    changed = 0
+    for members in groups.values():
+        if len(members) == 1:
+            members[0]["display_title"] = members[0]["title"]
+            continue
+        for depth in range(1, 5):
+            labels = []
+            for m in members:
+                own = m["title"].strip().lower()
+                crumbs = [c for c in m["breadcrumb"][1:] if c.strip().lower() != own] or m["breadcrumb"]
+                labels.append(f"{m['title']} ({' › '.join(crumbs[-depth:])})" if crumbs else m["title"])
+            if len(set(labels)) == len(labels):
+                break
+        else:
+            labels = [f"{m['title']} [{m['topic_id'] or m['file']}]" for m in members]
+        for m, label in zip(members, labels):
+            m["display_title"] = label
+            changed += 1
+    return changed
+
+
+def _build_records(index: dict[str, dict], cfg: SimpleNamespace):
+    """Convert kept pages to Markdown -> (records, render stats)."""
+    live = _live(index)
+    disambiguated = _assign_display_titles(live)
+    target = {m["file"]: {"anchor": m["anchor"], "part": m["part"]} for m in live}
+    for m in index.values():                       # a link to an alias lands on the surviving page
+        if m.get("duplicate_of") in target:
+            target[m["file"]] = target[m["duplicate_of"]]
+    ctx = render.RenderCtx(urljoin(cfg.url, "./"), cfg.images, target.get)
+    live_ids = {id(m) for m in live}
     records: list[dict] = []
-    seen_bodies: set[str] = set()
-    dupes = 0
     for meta in index.values():
         rec = {k: v for k, v in meta.items() if not k.startswith("_")}
-        if meta["status"] in ("keep", "rescued") and meta["has_content"]:
-            body = _clean_body_md(meta["_section"])
-            key = digest(body)
-            if key in seen_bodies:
-                rec["status"] = "drop"
-                rec["drop_reason"] = "duplicate"
-                dupes += 1
-            else:
-                seen_bodies.add(key)
-                rec["markdown"] = body
+        if id(meta) in live_ids:
+            ctx.part = meta["part"]
+            rec["markdown"] = render.to_markdown(meta["_section"], ctx)
         records.append(rec)
-    return records, dupes
+    ctx.stats["titles_disambiguated"] = disambiguated
+    return records, ctx.stats
 
 
 def stage_extract(cfg: SimpleNamespace) -> None:
@@ -722,11 +822,22 @@ def stage_extract(cfg: SimpleNamespace) -> None:
               file=sys.stderr)
         sys.exit(1)
 
-    index = _index_pages(files)
+    state_path = html_dir.parent / STATE_FILE
+    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    nav = {Path(e["file"]).name: e["nav"] for e in state.values()
+           if isinstance(e, dict) and "file" in e and "nav" in e}
+    if not nav:
+        print("[extract] WARNING: no navigation order in the mirror state; pages fall back to "
+              "breadcrumb order. Run the mirror stage once to record it.", file=sys.stderr)
+
+    index = _index_pages(files, nav)
     _classify(index, cfg.include, cfg.exclude)
     _rescue_linked(index, 0)          # rescue disabled: mirror prunes at crawl time
     title_dropped = _drop_by_title(index, cfg.title_exclude)
-    records, dupes = _build_records(index)
+    empty = _drop_empty(index, cfg.images)
+    id_dupes, text_dupes = _dedupe(index)
+    api_pages = _tag_parts(index, cfg.api_reference, API_REFERENCE_CRUMBS)
+    records, rstats = _build_records(index, cfg)
 
     _write_text(cfg.json_path, json.dumps(records, indent=2))
 
@@ -735,8 +846,14 @@ def stage_extract(cfg: SimpleNamespace) -> None:
     drop = sum(1 for r in records if r["status"] == "drop")
     unk = sum(1 for r in records if r["product"] == "(unknown)" and r["status"] != "drop")
     print(f"[extract] {len(records)} pages — kept {kept}, rescued {resc}, dropped {drop} "
-          f"(title-excluded {title_dropped}, duplicate {dupes})"
+          f"(title-excluded {title_dropped}, empty {empty}, duplicate topic id {id_dupes}, "
+          f"identical text {text_dupes})"
           f"{f', unknown-product kept {unk}' if unk else ''}")
+    print(f"[extract] {api_pages} API-reference pages routed to their own file; "
+          f"{rstats['callouts']} callouts, {rstats['tables_as_lists']} tables as lists, "
+          f"{rstats['links_internal']} internal links -> anchors, {rstats['links_live_site']} -> live site, "
+          f"images: {rstats['images_removed']} removed, {rstats['images_kept_as_text']} kept as text, "
+          f"{rstats['images_absolute']} absolute; {rstats['titles_disambiguated']} titles disambiguated")
     print(f"[extract] wrote {cfg.json_path}")
 
 
@@ -745,29 +862,21 @@ def stage_extract(cfg: SimpleNamespace) -> None:
 # ===========================================================================
 
 def _demote_headings(body: str, by: int = 2) -> str:
-    """Shift ATX headings deeper (so page content nests under its H3), drop the
-    body's leading duplicate H1 (the page title), and leave code fences alone."""
-    out, in_code, dropped_h1 = [], False, False
-    for line in body.split("\n"):
-        if line.lstrip().startswith("```"):
-            in_code = not in_code
-            out.append(line)
-            continue
-        if not in_code:
-            mt = re.match(r"^(#{1,6})(\s.*)$", line)
-            if mt:
-                level = len(mt.group(1))
-                if not dropped_h1 and level == 1:
-                    dropped_h1 = True
-                    continue  # drop duplicate title
-                new = min(level + by, 6)
-                line = "#" * new + mt.group(2)
-        out.append(line)
-    return "\n".join(out).strip()
+    """Nest a page's headings under its H3; anything that would pass H6 becomes
+    a bold lead-in instead of collapsing into H6 (see cx_docs_render)."""
+    return render.demote_headings(body, by)
+
+
+def _title_of(rec: dict) -> str:
+    return rec.get("display_title") or rec["title"]
+
+
+def _anchor_of(rec: dict) -> str:
+    return rec.get("anchor") or render.anchor_for(rec["file"])
 
 
 def _page_lines(rec: dict) -> list[str]:
-    """One page as an H3 block: title, provenance line, demoted body."""
+    """One page as an H3 block: title with a stable anchor, provenance line, body."""
     meta = []
     if rec["breadcrumb"]:
         meta.append(" › ".join(rec["breadcrumb"]))
@@ -775,7 +884,7 @@ def _page_lines(rec: dict) -> list[str]:
         meta.append(f"Modified: {rec['modified']}")
     meta.append(f"Source: {rec['file']}")
     return [
-        f"### {rec['title']}\n",
+        f"### {_title_of(rec)} {{#{_anchor_of(rec)}}}\n",
         f"_{' · '.join(meta)}_\n",
         _demote_headings(rec["markdown"]),
         "",
@@ -796,41 +905,65 @@ def _newest_modified(records: list[dict]) -> str:
     return f"{best:%B} {best.day}, {best.year}" if best else ""
 
 
-def stage_combine(cfg: SimpleNamespace) -> None:
-    if not Path(cfg.json_path).is_file():
-        sys.exit(f"[combine] {cfg.json_path} not found - run the extract stage first")
-    records = json.loads(Path(cfg.json_path).read_text(encoding="utf-8"))
-    kept = [r for r in records if r["status"] == "keep" and r.get("markdown")]
-    rescued = [r for r in records if r["status"] == "rescued" and r.get("markdown")]
+def _stale_lines(records: list[dict], months: int, now: datetime) -> list[str]:
+    """Front-matter index of pages whose topic was last modified more than
+    `months` months ago, oldest first."""
+    if months <= 0:
+        return []
+    stale = []
+    for r in records:
+        try:
+            d = datetime.strptime(r.get("modified", "").strip(), "%B %d, %Y")
+        except ValueError:
+            continue
+        if (now - d).days > months * 30.44:
+            stale.append((d, _title_of(r), _anchor_of(r)))
+    if not stale:
+        return []
+    stale.sort()
+    lines = [f"**Stale pages** — last modified more than {months} months ago "
+             f"({len(stale)} of {len(records)}), oldest first:\n"]
+    lines += [f"- [{t}](#{a}) — {d:%B} {d.day}, {d.year}" for d, t, a in stale]
+    lines.append("")
+    return lines
 
-    # Group kept pages by product.
+
+def _part_path(path: str, part: str) -> str:
+    """docs/guide-2026-10-05.md -> docs/guide-2026-10-05-api-reference.md"""
+    root, ext = os.path.splitext(path)
+    return f"{root}-{part}{ext}"
+
+
+def _doc_lines(cfg: SimpleNamespace, kept: list[dict], rescued: list[dict], title: str,
+               note: str = "") -> list[str]:
+    """Render one document (the main guide, or the API-reference part)."""
     by_product: dict[str, list] = {}
     for r in kept:
         by_product.setdefault(r["product"], []).append(r)
     for lst in by_product.values():
-        lst.sort(key=lambda r: (r["breadcrumb"], r["title"]))
+        # site navigation order first; breadcrumb/title only break ties or fill gaps
+        lst.sort(key=lambda r: (r["nav"] if r.get("nav") is not None else 10 ** 9,
+                                r["breadcrumb"], r["title"]))
 
     ordered = order_products(by_product, cfg.product_order)
-
     date = time.strftime("%Y-%m-%d")
     excluded = ", ".join(cfg.exclude) if not cfg.include else \
         f"(include-only: {', '.join(cfg.include)})"
-    lines = []
-    lines.append(f"# {cfg.doc_title}\n")
-    lines.append(f"**Captured:** {date}  ")
-    lines.append(f"**Content current through:** {_newest_modified(kept) or 'unknown'}\n")
-    lines.append(f"_Source: {cfg.url}_\n")
-    lines.append(f"_Pages: {len(kept)} kept across {len(ordered)} products; "
-                 f"{len(rescued)} referenced. Excluded: {excluded}._\n")
-
-    lines += contents_lines(
-        ordered, {p: len(by_product[p]) for p in ordered}, len(rescued))
+    lines = [f"# {title}\n",
+             f"**Captured:** {date}  ",
+             f"**Content current through:** {_newest_modified(kept) or 'unknown'}\n",
+             f"_Source: {cfg.url}_\n",
+             f"_Pages: {len(kept)} kept across {len(ordered)} products; "
+             f"{len(rescued)} referenced. Excluded: {excluded}._\n"]
+    if note:
+        lines.append(f"_{note}_\n")
+    lines += contents_lines(ordered, {p: len(by_product[p]) for p in ordered}, len(rescued))
+    lines += _stale_lines(kept + rescued, cfg.stale_months, datetime.now())
 
     for p in ordered:
         lines.append(f"## {p}\n")
-        # per-section page list for navigability
-        for r in by_product[p]:
-            lines.append(f"- {r['title']}")
+        for r in by_product[p]:                      # per-section page list for navigability
+            lines.append(f"- [{_title_of(r)}](#{_anchor_of(r)})")
         lines.append("")
         for r in by_product[p]:
             lines += _page_lines(r)
@@ -839,14 +972,59 @@ def stage_combine(cfg: SimpleNamespace) -> None:
         lines.append("## Referenced Material\n")
         lines.append("_Pages from excluded products that are cross-referenced "
                      "by kept content (e.g. supported-language tables)._\n")
-        rescued.sort(key=lambda r: (r["product"], r["title"]))
+        rescued = sorted(rescued, key=lambda r: (r["product"], r["title"]))
         for r in rescued:
             lines += _page_lines(r)
+    return lines
 
-    _write_text(cfg.md_path, "\n".join(lines) + "\n")
-    size = Path(cfg.md_path).stat().st_size
-    print(f"[combine] wrote {cfg.md_path} — {len(kept)+len(rescued)} pages, "
-          f"{size/1_048_576:.2f} MB")
+
+def _check_quality(text: str, label: str, limits: dict) -> tuple[dict, list[str]]:
+    m = render.quality_metrics(text, slugify)
+    failed = [f"{label}: {k} = {m[k]} (limit {lim})" for k, lim in limits.items()
+              if lim is not None and m[k] > lim]
+    return m, failed
+
+
+def stage_combine(cfg: SimpleNamespace) -> None:
+    if not Path(cfg.json_path).is_file():
+        sys.exit(f"[combine] {cfg.json_path} not found - run the extract stage first")
+    records = json.loads(Path(cfg.json_path).read_text(encoding="utf-8"))
+    kept_all = [r for r in records if r["status"] == "keep" and r.get("markdown")]
+    resc_all = [r for r in records if r["status"] == "rescued" and r.get("markdown")]
+
+    api = [r for r in kept_all if r.get("part") == "api"]
+    main = [r for r in kept_all if r.get("part") != "api"]
+    api_path = _part_path(cfg.md_path, "api-reference")
+    note = (f"{len(api)} API-reference pages are in {os.path.basename(api_path)}, because they "
+            f"overlap the API spec job.") if api else ""
+    jobs = [(cfg.md_path, "main", main, resc_all, cfg.doc_title, note)]
+    if api:
+        jobs.append((api_path, "api-reference", api, [], f"{cfg.doc_title} — API Reference Pages",
+                     f"Split from {os.path.basename(cfg.md_path)}; links to pages in that file "
+                     f"point at docs.checkmarx.com."))
+
+    totals: dict = {}
+    failures: list[str] = []
+    for path, label, kept, rescued, title, jnote in jobs:
+        text = "\n".join(_doc_lines(cfg, kept, rescued, title, jnote)) + "\n"
+        _write_text(path, text)
+        size = os.path.getsize(path)
+        metrics, failed = _check_quality(text, label, cfg.quality_limits)
+        failures += failed
+        for k in ("dead_links", "broken_images", "h6_headings", "duplicate_ids"):
+            totals[k] = totals.get(k, 0) + metrics[k]
+        print(f"[combine] wrote {path} — {len(kept) + len(rescued)} pages, {size/1_048_576:.2f} MB")
+        if metrics["dead_link_examples"]:
+            print(f"[combine]   dead link examples: {', '.join(metrics['dead_link_examples'])}")
+    print(f"[combine] quality: dead links {totals['dead_links']}, broken images {totals['broken_images']}, "
+          f"H6 headings {totals['h6_headings']}, duplicate ids {totals['duplicate_ids']}")
+    if failures and not cfg.no_quality_gate:
+        print("[combine] QUALITY GATE FAILED (the documents were written; "
+              "pass --no-quality-gate to ignore):", file=sys.stderr)
+        for f in failures:
+            print(f"[combine]   - {f}", file=sys.stderr)
+        print(f"[combine] kept {cfg.json_path} for inspection", file=sys.stderr)
+        sys.exit(3)
     if not cfg.keep_temp:        # the extract JSON is an intermediate, rebuilt by the next extract
         Path(cfg.json_path).unlink(missing_ok=True)
         print(f"[combine] removed temporary {cfg.json_path} (use --keep-temp to keep it)")
@@ -857,6 +1035,11 @@ def stage_combine(cfg: SimpleNamespace) -> None:
 # ===========================================================================
 
 Block = tuple[str, str]                    # (page title, verbatim block text)
+
+
+def _strip_anchor(title: str) -> str:
+    """`Title {#p-123}` -> `Title`."""
+    return re.sub(r"\s*\{#[^}]+\}\s*$", "", title)
 
 
 def _split_canonical(text: str) -> tuple[dict[str, list[Block]], list[Block]]:
@@ -957,7 +1140,7 @@ def stage_compress(cfg: SimpleNamespace) -> None:
     for p in ordered:
         out.append(f"## {p}\n")
         for t, _ in kept_sections[p]:
-            out.append(f"- {t}")
+            out.append(f"- {_strip_anchor(t)}")
         out.append("")
         for t, b in kept_sections[p]:
             out.append(f"### {t}\n")
@@ -1010,6 +1193,11 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
         md_path=_dated_path(pick(args.md_path, CANONICAL_MD)),
         md_out=args.md_out,
         keep_temp=args.keep_temp,
+        images=pick(args.images, IMAGES),
+        api_reference=pick(args.api_reference, API_REFERENCE),
+        stale_months=pick(args.stale_months, STALE_MONTHS),
+        quality_limits=dict(QUALITY_LIMITS),
+        no_quality_gate=args.no_quality_gate,
         title_exclude=pick(args.title_exclude, TITLE_EXCLUDE_PATTERNS),
         doc_title=pick(args.doc_title, DOC_TITLE),
         product_order=PRODUCT_ORDER,
@@ -1043,6 +1231,13 @@ def main() -> None:
     ap.add_argument("--md-out", help="Output path for the compress stage (default: overwrite --md-path)")
     ap.add_argument("--title-exclude", nargs="*", help="Regexes; drop pages whose title matches")
     ap.add_argument("--doc-title")
+    ap.add_argument("--images", choices=["strip", "absolute"],
+                    help="Images: strip (keep meaningful alt text) or rewrite to docs.checkmarx.com URLs")
+    ap.add_argument("--api-reference", choices=["separate", "inline"],
+                    help="Write API-reference pages to their own file (default) or keep them inline")
+    ap.add_argument("--stale-months", type=int, help="Front-matter index of pages not modified for N months (0 = off)")
+    ap.add_argument("--no-quality-gate", action="store_true",
+                    help="Do not fail combine when a quality metric exceeds its limit")
     ap.add_argument("--keep-temp", action="store_true",
                     help="Keep the temporary extract JSON after combine (deleted by default)")
     import cx_api_spec          # no third-party imports at module load, so docs-only runs stay light

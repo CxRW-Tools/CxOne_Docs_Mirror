@@ -4,7 +4,7 @@ Downloads Checkmarx documentation as two independent jobs. Each writes to its ow
 
 | Job | Source | Output folder | Main deliverable |
 |---|---|---|---|
-| **User docs** | docs.checkmarx.com | `docs/` | one canonical Markdown file |
+| **User docs** | docs.checkmarx.com | `docs/` | one canonical Markdown file (plus a separate API-reference part) |
 | **API spec** | live tenant catalog + Stoplight API reference | `api/` | one merged OpenAPI 3.0.3 candidate spec |
 
 The API stage never touches your existing spec; it produces a candidate and a drift report to review.
@@ -33,6 +33,10 @@ Useful flags:
 | Flag | Effect |
 |---|---|
 | `--keep-temp` | keep the temporary `docs/cx-extracted.json` after combine |
+| `--images strip\|absolute` | docs: drop images (keeping meaningful alt text, the default) or rewrite them to docs.checkmarx.com URLs |
+| `--api-reference separate\|inline` | docs: write API-reference pages to their own file (default) or keep them inline |
+| `--stale-months N` | docs: front-matter index of pages not modified for N months (default 18, 0 = off) |
+| `--no-quality-gate` | docs: do not fail combine (exit 3) when a quality metric exceeds its limit |
 | `--baseline FILE` | API: diff against your current spec |
 | `--overlay DIR` | API: hand-maintained operations neither source has (default `api/overlay/`) |
 | `--used-endpoints FILE` | API: exit with code 10 if drift touches an endpoint you depend on |
@@ -52,6 +56,7 @@ No credentials are used by default. The `ai-triage` and `remediation` `openapi.j
 ```
 docs/                                   user docs (generated, gitignored)
   checkmarx-one-docs-<date>.md
+  checkmarx-one-docs-<date>-api-reference.md
   changes-<date>.md
   mirror-state.json
   manifest.json
@@ -73,9 +78,10 @@ api/                                    API spec (generated, gitignored except o
 
 | File | Written by | Contents | Use | Lifecycle |
 |---|---|---|---|---|
-| `checkmarx-one-docs-<date>.md` | combine (compress rewrites it) | All kept pages in one Markdown file: doc > product > page, with a contents list. `<date>` is the run date. | **The deliverable.** Feed it to a knowledge base or search. | Kept; one new file per run date |
+| `checkmarx-one-docs-<date>.md` | combine (compress rewrites it) | All kept pages in one Markdown file: doc > product > page, in site-navigation order, with a contents list and a stale-pages index. Every page heading carries a stable anchor (`{#p-<topic id>}`). `<date>` is the run date. | **The deliverable.** Feed it to a knowledge base or search. | Kept; one new file per run date |
+| `checkmarx-one-docs-<date>-api-reference.md` | combine | The ~30 API-reference pages (they overlap the API spec job), same format. Absent with `--api-reference inline` | Keep the user guide and the API reference separate | Kept; one per run date |
 | `changes-<date>.md` | mirror | Pages new, updated, and removed from the nav since the previous run | Review what changed in the docs | Kept; one per run date |
-| `mirror-state.json` | mirror | Per-URL hash, title, product and modified dates | Lets the next run skip unchanged pages | Kept; do not delete or every page is treated as new |
+| `mirror-state.json` | mirror | Per-URL hash, title, product, modified dates and position in the site navigation (`nav`) | Lets the next run skip unchanged pages | Kept; do not delete or every page is treated as new |
 | `manifest.json` | mirror | The page files that are live in this run | Makes extract ignore stale cached pages | Rewritten each mirror run |
 | `failures.log` | mirror | URLs that could not be fetched | Find pages to retry | Rewritten each run; removed when nothing failed |
 | `pages/en/...` | mirror | Cached HTML of each mirrored page | Source for extract; allows change detection | Cache; safe to delete (the next mirror refetches everything) |
@@ -96,6 +102,25 @@ api/                                    API spec (generated, gitignored except o
 | `overlay/*.yaml` or `*.json` | you | Operations (same shape as the spec) that neither source has; applied after the merge and flagged when a source starts covering them, unless the operation sets `x-overlay-keep: true` | Keep hand-added endpoints across runs | Input; tracked in git |
 
 Rebuild without the network using `--from-raw api/raw`. A run with `--dry-run` fetches but writes only the report.
+
+## How the docs document is built
+
+Every transformation below is deterministic: the same cached HTML always gives the same Markdown. The renderer is `cx_docs_render.py`; the stage logic is in `cx_docs_mirror.py`.
+
+| Concern | What happens |
+|---|---|
+| Duplicate pages | One page per topic id (`34965-<id>-...`). The original slug wins over a `...-<id>` re-publication under another parent, then the earlier navigation position. Identical visible text is a second pass. Dropped pages are remembered as aliases, so links to them still land on the survivor. |
+| Headings | A page is an H3; its own headings nest below it. Anything that would pass H6 becomes a bold lead-in instead of being squashed into H6. |
+| Anchors | Each page heading is `### Title {#p-<topic id>}`, keyed on the topic id so links survive title changes. Pages that share a title get the breadcrumb tail (`General Settings (User Management)`). |
+| Links | Links between pages in the same file become `#p-<id>`. UUID fragments are dropped. Links to pages that are not in the file (excluded products, or the other part) point at docs.checkmarx.com. In-page jumps keep just the words. |
+| Images | Stripped by default (a meaningful alt text is kept as `[Image: ...]`; file-name alt text is dropped). `--images absolute` keeps them as docs.checkmarx.com URLs. A relative image path is never emitted. |
+| Callouts | Note / Notice / Tip / Warning blocks and sidebars become `> **Note:** ...` blockquotes. |
+| Tables | Simple tables stay pipe tables. Tables with block content in a cell (lists, code, several paragraphs) and every nested table become definition-list style bullets. |
+| Order | Pages follow the site navigation order recorded by the mirror stage, not the alphabet. Run the mirror stage once to record it. |
+| API reference | Pages under a breadcrumb matching `API_REFERENCE_CRUMBS` go to `...-api-reference.md`. |
+| Staleness | The front matter lists pages last modified more than `--stale-months` months ago, oldest first. |
+
+At the end of combine a quality line is printed: dead links, broken images, H6 headings, duplicate ids. `QUALITY_LIMITS` in `cx_docs_mirror.py` sets the limits; dead links, broken images and duplicate ids must be 0 or combine exits with code 3 (after writing the files, and keeping `cx-extracted.json` for inspection). H6 headings are reported only. Use `--no-quality-gate` to ignore the limits.
 
 ## How the API spec is built
 
