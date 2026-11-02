@@ -170,6 +170,49 @@ def sweep_tmp(root: Path) -> None:
             f.unlink(missing_ok=True)
 
 
+def force_remove(path) -> bool:
+    """Delete a file or directory tree, tolerating read-only files and sync
+    clients (OneDrive) that refuse a delete. Returns True when it is gone."""
+    import shutil
+    import stat
+    p = Path(path)
+
+    def fix(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+
+    try:
+        if p.is_dir():
+            shutil.rmtree(p, onerror=fix)
+        elif p.exists():
+            try:
+                p.unlink()
+            except PermissionError:
+                os.chmod(p, stat.S_IWRITE)
+                p.unlink()
+    except OSError:
+        pass
+    return not p.exists()
+
+
+def prune_raw(raw_dir: Path, keep: set) -> int:
+    """Remove files under raw_dir that this run did not produce. Returns how many
+    could NOT be removed (they are harmless: nothing reads files outside the new set)."""
+    left = 0
+    if raw_dir.is_dir():
+        root = raw_dir.resolve()
+        for f in sorted(raw_dir.rglob("*"), reverse=True):
+            rel = f.resolve().relative_to(root).as_posix()
+            if f.is_file() and rel not in keep and rel != "provenance.json":
+                left += not force_remove(f)
+            elif f.is_dir() and not any(f.iterdir()):
+                force_remove(f)
+    return left
+
+
 def dump_json(path: Path, obj) -> None:
     """Deterministic JSON: sorted keys, 2-space indent, trailing newline."""
     write_atomic(path, json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
@@ -2077,7 +2120,15 @@ def run(cfg) -> int:
         return EXIT_FATAL
 
 
+def check_inputs(cfg) -> None:
+    """Fail fast, before anything is downloaded, if a file the run needs is missing."""
+    for flag, path in (("--baseline", cfg.baseline), ("--used-endpoints", cfg.used_endpoints)):
+        if path and not abs_path(path).is_file():
+            raise FatalError(f"{flag} file not found: {path}")
+
+
 def _run(cfg) -> int:
+    check_inputs(cfg)
     if not cfg.skip_validation:
         _load_validator()          # fail before fetching anything if it is missing
     if cfg.auth_token_env and not cfg.from_raw:
@@ -2095,7 +2146,8 @@ def _run(cfg) -> int:
             raise FatalError(f"nothing under {cfg.from_raw}")
         print(f"[api-spec] rebuilding from {cfg.from_raw} (no network)")
     else:
-        prev = RawSet.load(raw_dir) if raw_dir.is_dir() else None
+        # --fresh: no stale fallback copies; a failed fetch is a failure, not last run's file
+        prev = RawSet.load(raw_dir) if raw_dir.is_dir() and not getattr(cfg, "fresh", False) else None
         print(f"[api-spec] fetching live catalog from {cfg.base_url} and Stoplight "
               f"(<= {min(cfg.concurrency, API_CONCURRENCY)} concurrent)")
         raw, fnotes = asyncio.run(fetch_all(cfg, prev))
@@ -2103,6 +2155,11 @@ def _run(cfg) -> int:
         fetched = True
         if not cfg.dry_run:
             raw.save(raw_dir)
+            if getattr(cfg, "fresh", False):
+                left = prune_raw(raw_dir, set(raw.blobs))
+                if left:
+                    notes.append(f"{left} old raw files could not be deleted (a sync client or "
+                                 f"permissions?); they are ignored")
 
     lives, extras, sls, refs = load_sources(raw, notes)
     if not lives or not sls:
@@ -2111,6 +2168,9 @@ def _run(cfg) -> int:
     baseline = _read_doc(abs_path(cfg.baseline)) if cfg.baseline else None
     hist_path = out / "history.json"
     history = json.loads(read_input_text(hist_path, "history")) if hist_path.is_file() else {}
+    if getattr(cfg, "fresh", False) and history:
+        notes.append("--fresh: history.json ignored; a new history starts with this run")
+        history = {}
     if history and history.get("version") != HISTORY_VERSION:
         notes.append("history.json was written before the placement fix and is ignored; "
                      "a fresh history starts with this run")
@@ -2181,6 +2241,10 @@ def add_arguments(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--auth-token-env", metavar="VAR",
                    help="Name of an environment variable holding a tenant bearer token. Opt-in: "
                         "used only to fetch the extra services that need a login; never stored or printed")
+    g.add_argument("--fresh", action="store_true",
+                   help="Start clean: re-download every docs page and ignore the saved mirror state; "
+                        "for the API stage ignore history.json and cached downloads (stale copies are not "
+                        "used as a fallback). Nothing needs deleting by hand")
     g.add_argument("--run-date", help="Pin the sync date (YYYY-MM-DD), e.g. to reproduce a run")
     g.add_argument("--skip-validation", action="store_true",
                    help="Do not run the OpenAPI 3.0 validator on the merged spec (it runs by default)")
@@ -2203,6 +2267,7 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
         skip_validation=getattr(args, "skip_validation", False),
         auth_token_env=getattr(args, "auth_token_env", None), auth_token=None,
         allow_shrink=getattr(args, "allow_shrink", False),
+        fresh=getattr(args, "fresh", False),
         concurrency=API_CONCURRENCY, timeout=API_TIMEOUT, retries=API_RETRIES,
         allowed_hosts={(urlparse(base).hostname or "").lower(), "stoplight.io", "checkmarx.stoplight.io"})
 
