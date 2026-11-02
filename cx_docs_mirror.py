@@ -64,6 +64,7 @@ from urllib.parse import urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+import cx_api_spec
 import cx_docs_render as render
 
 # ===========================================================================
@@ -573,8 +574,10 @@ async def _mirror(cfg: SimpleNamespace) -> None:
     _sweep_tmp(base)
     state_path, manifest_path = base / STATE_FILE, base / MANIFEST_FILE
     fail_log = base / "failures.log"
-    state: dict = (json.loads(state_path.read_text(encoding="utf-8"))
-                   if state_path.exists() else {})
+    state: dict = ({} if cfg.fresh else
+                   json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {})
+    if cfg.fresh:
+        print("[mirror] --fresh: ignoring the saved state and re-downloading every page")
 
     start = time.time()
     limits = httpx.Limits(max_connections=cfg.concurrency)
@@ -648,6 +651,11 @@ async def _mirror(cfg: SimpleNamespace) -> None:
 
     stale = [p for p in out_dir.rglob("*.html")
              if p.relative_to(out_dir).as_posix() not in set(manifest)]
+    if cfg.fresh and stale:
+        stuck = sum(not cx_api_spec.force_remove(p) for p in stale)
+        print(f"[mirror] --fresh: removed {len(stale) - stuck} cached pages that are no longer in the "
+              f"nav" + (f"; {stuck} could not be deleted and are ignored" if stuck else ""))
+        stale = [p for p in stale if p.exists()]
     dt = time.time() - start
     print(f"\n[mirror] done in {dt/60:.1f} min — new {stats['new']}, updated {stats['updated']}, "
           f"unchanged {stats['unchanged'] + stats['not_modified']} "
@@ -1280,7 +1288,8 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
         retries=pick(args.retries, RETRIES),
         wait=pick(args.wait, POLITE_WAIT),
         max_pages=pick(args.max_pages, 0),
-        force=args.force,
+        force=args.force or getattr(args, "fresh", False),
+        fresh=getattr(args, "fresh", False),
         html_dir=pick(args.html_dir, HTML_DIR),
         json_path=pick(args.json_path, EXTRACT_JSON),
         md_path=_dated_path(pick(args.md_path, CANONICAL_MD)),
@@ -1338,9 +1347,13 @@ def main() -> None:
                     help="Do not fail combine when a quality metric exceeds its limit")
     ap.add_argument("--keep-temp", action="store_true",
                     help="Keep the temporary extract JSON after combine (deleted by default)")
-    import cx_api_spec          # no third-party imports at module load, so docs-only runs stay light
-    cx_api_spec.add_arguments(ap)
+    cx_api_spec.add_arguments(ap)           # also defines --fresh, which applies to both jobs
     args = ap.parse_args()
+    if args.stage in ("api-spec", "all"):          # a typo in --baseline should not cost a 5-minute crawl
+        try:
+            cx_api_spec.check_inputs(cx_api_spec.build_cfg(args))
+        except cx_api_spec.FatalError as e:
+            sys.exit(f"[api-spec] FATAL: {e}")
 
     run_docs = args.stage in ("docs", "all")
     if run_docs or args.stage in ("mirror", "extract", "combine", "compress"):

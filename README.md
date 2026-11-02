@@ -32,6 +32,7 @@ Useful flags:
 
 | Flag | Effect |
 |---|---|
+| `--fresh` | start clean without deleting anything by hand: re-download every docs page and ignore the saved mirror state; for the API stage ignore `history.json` and the cached downloads (no stale fallbacks) and drop old raw files |
 | `--keep-temp` | keep the temporary `docs/cx-extracted.json` after combine |
 | `--images strip\|absolute` | docs: drop images (keeping meaningful alt text, the default) or rewrite them to docs.checkmarx.com URLs |
 | `--api-reference separate\|inline` | docs: write API-reference pages to their own file (default) or keep them inline |
@@ -199,6 +200,8 @@ If you use `--auth-token-env`, it needs an already-issued bearer token, and `--a
 The adoption procedure lives in the consumer repo: see "Refreshing the spec" in [`spec/CLEANUP_NOTES.md`](https://github.com/CxRW-Tools/CxOne_Multi-Tool/blob/main/spec/CLEANUP_NOTES.md).
 
 ### Resetting `history.json`
+
+The easy way is `--fresh` (see Usage): it ignores the saved history and cached downloads for that run and rebuilds them, so nothing has to be deleted by hand. Files that a sync client (OneDrive) refuses to delete are reported and ignored.
 
 `history.json` records per-operation signatures, so a change to placement logic can leave spurious `removed_candidate` entries behind. Its format carries a version; a file written by an older version is ignored automatically (the run notes it) and a fresh history starts. To reset by hand, delete `api/history.json`.
 

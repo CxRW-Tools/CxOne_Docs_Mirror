@@ -35,6 +35,7 @@ def docs_args(*extra):
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--keep-temp", action="store_true")
     ap.add_argument("--no-quality-gate", action="store_true")
+    ap.add_argument("--fresh", action="store_true")
     return ap.parse_args(list(extra))
 
 
