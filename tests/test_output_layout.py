@@ -25,11 +25,15 @@ def docs_args(*extra):
         ap.add_argument(flag)
     for flag in ("--include", "--exclude", "--title-exclude"):
         ap.add_argument(flag, nargs="*")
-    for flag in ("--min-chars", "--concurrency", "--depth", "--timeout", "--retries", "--max-pages", "--rescue-depth"):
+    for flag in ("--min-chars", "--concurrency", "--depth", "--timeout", "--retries", "--max-pages", "--rescue-depth",
+                 "--stale-months"):
         ap.add_argument(flag, type=int)
+    ap.add_argument("--images")
+    ap.add_argument("--api-reference")
     ap.add_argument("--wait", type=float)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--keep-temp", action="store_true")
+    ap.add_argument("--no-quality-gate", action="store_true")
     return ap.parse_args(list(extra))
 
 
