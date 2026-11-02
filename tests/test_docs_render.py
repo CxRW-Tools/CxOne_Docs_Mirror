@@ -273,7 +273,7 @@ class Combine(unittest.TestCase):
         api_text = read_text(D._part_path(cfg.md_path, "api-reference"))
         self.assertNotIn("### Endpoint", text)
         self.assertIn("### Endpoint {#p-2}", api_text)
-        self.assertIn("1 API-reference pages are in", text)
+        self.assertIn("1 API-reference page is in", text)
 
     def test_stale_index(self):
         now = datetime.now()

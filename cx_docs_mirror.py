@@ -13,6 +13,11 @@ that write to separate outputs:
                  hierarchy (doc > product > page > page-content).
     4. COMPRESS  Post-process an existing canonical .md, dropping version /
                  changelog pages and duplicates. Not part of the default run.
+    5. ANALYZE   Cluster near-duplicate pages, flag Upcoming pages that also exist
+                 as ordinary pages and API paths missing from the spec (no LLM).
+    6. VIEWS     Compact reference view and lookup tables for agents (no LLM).
+    7. ENRICH    Optional, run by the /enrich-docs skill: per-page summaries and
+                 aliases in a separate companion file, checked against the source.
 
   API SPEC   (live tenant catalog + Stoplight -> one OpenAPI 3.0.3 candidate)
     api-spec     Fetch both sources, merge them, and report drift against a
@@ -30,6 +35,9 @@ Run everything (default), or any part in isolation:
     python cx_docs_mirror.py --stage extract
     python cx_docs_mirror.py --stage combine
     python cx_docs_mirror.py --stage compress
+    python cx_docs_mirror.py --stage analyze       # clusters + review report from the combined guide
+    python cx_docs_mirror.py --stage views         # compact reference view + lookup tables
+    python cx_docs_mirror.py --stage enrich-prep   # LLM step 1/3 (then /enrich-docs, then enrich-check)
     python cx_docs_mirror.py --stage api-spec --baseline path/to/cxone_openapi.json
 
 All knobs live in the CONFIG block below (target URL, what to include/exclude,
@@ -65,7 +73,10 @@ from urllib.parse import urldefrag, urljoin, urlparse
 from bs4 import BeautifulSoup
 
 import cx_api_spec
+import cx_docs_analysis
+import cx_docs_enrich
 import cx_docs_render as render
+import cx_docs_views
 
 # ===========================================================================
 # CONFIG  — edit these defaults; all are overridable via command-line flags.
@@ -124,10 +135,15 @@ IMAGES = "strip"           # strip (keep meaningful alt text) | absolute (docs.c
 # overlaps the API spec job; with API_REFERENCE = "separate" they get their own file.
 API_REFERENCE = "separate"  # separate | inline
 API_REFERENCE_CRUMBS: list[str] = [r"^Checkmarx One API Documentation$", r"REST API Reference$"]
+# The CxQL method reference is one ~360 KB page that most readers never need; it gets
+# its own file too (CXQL_REFERENCE = "inline" keeps it in the main guide).
+CXQL_REFERENCE = "separate"  # separate | inline
+CXQL_REFERENCE_PATTERNS: list[str] = [r"^SAST Query Language APIs$"]
 STALE_MONTHS = 18          # front-matter index of pages not modified for this long (0 = off)
 # Combine fails (exit 3, after writing) when a metric exceeds its limit; None = report only.
 QUALITY_LIMITS: dict[str, int | None] = {
-    "dead_links": 0, "broken_images": 0, "duplicate_ids": 0, "h6_headings": None}
+    "dead_links": 0, "broken_images": 0, "duplicate_ids": 0, "toggle_leftovers": 0,
+    "h6_headings": None, "blockquote_pct": None}
 
 # --- Crawl tuning -----------------------------------------------------------
 CONCURRENCY = 8            # simultaneous HTTP requests
@@ -771,15 +787,44 @@ def _drop_by_title(index: dict[str, dict], patterns: list[str]) -> int:
     return dropped
 
 
+def _is_child(parent: dict, page: dict) -> bool:
+    """The breadcrumb ends with the page's own title, so a child's parent trail is the
+    parent's whole breadcrumb."""
+    return (page is not parent and page["status"] in ("keep", "rescued") and page["has_content"]
+            and bool(parent["breadcrumb"]) and page["breadcrumb"][:-1] == parent["breadcrumb"])
+
+
 def _drop_empty(index: dict[str, dict], images: str) -> int:
     """Pages with no content render to nothing; drop them before links are resolved
-    so no link can point at a page that is not in the document."""
+    so no link can point at a page that is not in the document. An empty section page
+    that has child pages is kept as a 'shell' and later rendered as a list of them."""
     n = 0
     for m in index.values():
         if m["status"] in ("keep", "rescued") and m["has_content"] and render.is_empty(m["_section"], images):
+            if any(_is_child(m, c) for c in index.values()):
+                m["shell"] = True
+                continue
             m["status"], m["drop_reason"] = "drop", "empty"
             n += 1
     return n
+
+
+def _shell_children(shell: dict, live: list[dict]) -> list[dict]:
+    kids = [c for c in live if c["part"] == shell["part"] and _is_child(shell, c)]
+    return sorted(kids, key=lambda c: (c["nav"] if c["nav"] is not None else 10 ** 9, c["title"]))
+
+
+def _resolve_shells(index: dict[str, dict]) -> int:
+    """Drop shells whose children did not survive (dedupe, parts); repeat for shells of shells."""
+    dropped = 0
+    while True:
+        live = _live(index)
+        gone = [m for m in live if m.get("shell") and not _shell_children(m, live)]
+        if not gone:
+            return dropped
+        for m in gone:
+            m["status"], m["drop_reason"] = "drop", "empty"
+            dropped += 1
 
 
 def _live(index: dict[str, dict]) -> list[dict]:
@@ -840,16 +885,17 @@ def _assign_anchors(live: list[dict]) -> int:
     return n
 
 
-def _tag_parts(index: dict[str, dict], mode: str, patterns: list[str]) -> int:
-    """Pages that are API reference get part='api' so combine can write them to
-    their own file; with mode 'inline' everything stays in the main document."""
+def _tag_parts(index: dict[str, dict], mode: str, patterns: list[str], part: str = "api") -> int:
+    """Pages that match `patterns` get part=<part> ('api', 'cxql') so combine can write
+    them to their own file; with mode 'inline' everything stays in the main document."""
     rx = [re.compile(p, re.I) for p in patterns]
     n = 0
     for m in index.values():
-        m["part"] = "main"
         if mode == "separate" and any(r.search(c) for r in rx for c in [*m["breadcrumb"], m["title"]]):
-            m["part"] = "api"
+            m["part"] = part
             n += m["status"] in ("keep", "rescued")
+        elif m.get("part") in (None, part):
+            m["part"] = "main"
     return n
 
 
@@ -879,8 +925,16 @@ def _assign_display_titles(live: list[dict]) -> int:
     return changed
 
 
+def _shell_markdown(children: list[dict]) -> str:
+    """A section page with no text of its own: list its child pages."""
+    lines = ["_This section page has no text of its own. Pages in this section:_", ""]
+    lines += [f"- [{c['display_title']}](#{c['anchor']})" for c in children]
+    return "\n".join(lines)
+
+
 def _build_records(index: dict[str, dict], cfg: SimpleNamespace):
     """Convert kept pages to Markdown -> (records, render stats)."""
+    _resolve_shells(index)
     live = _live(index)
     variants = _assign_anchors(live)
     disambiguated = _assign_display_titles(live)
@@ -895,7 +949,11 @@ def _build_records(index: dict[str, dict], cfg: SimpleNamespace):
         rec = {k: v for k, v in meta.items() if not k.startswith("_")}
         if id(meta) in live_ids:
             ctx.part = meta["part"]
-            rec["markdown"] = render.to_markdown(meta["_section"], ctx)
+            if meta.get("shell"):
+                rec["markdown"] = _shell_markdown(_shell_children(meta, live))
+                ctx.stats["shell_pages"] += 1
+            else:
+                rec["markdown"] = render.to_markdown(meta["_section"], ctx)
         records.append(rec)
     ctx.stats["titles_disambiguated"] = disambiguated
     ctx.stats["topic_variants"] = variants
@@ -936,7 +994,8 @@ def stage_extract(cfg: SimpleNamespace) -> None:
     title_dropped = _drop_by_title(index, cfg.title_exclude)
     empty = _drop_empty(index, cfg.images)
     id_dupes, text_dupes = _dedupe(index)
-    api_pages = _tag_parts(index, cfg.api_reference, API_REFERENCE_CRUMBS)
+    api_pages = _tag_parts(index, cfg.api_reference, API_REFERENCE_CRUMBS, "api")
+    cxql_pages = _tag_parts(index, cfg.cxql_reference, CXQL_REFERENCE_PATTERNS, "cxql")
     records, rstats = _build_records(index, cfg)
 
     _write_text(cfg.json_path, json.dumps(records, indent=2))
@@ -949,7 +1008,9 @@ def stage_extract(cfg: SimpleNamespace) -> None:
           f"(title-excluded {title_dropped}, empty {empty}, duplicate topic id {id_dupes}, "
           f"identical text {text_dupes})"
           f"{f', unknown-product kept {unk}' if unk else ''}")
-    print(f"[extract] {api_pages} API-reference pages routed to their own file; "
+    print(f"[extract] {api_pages} API-reference and {cxql_pages} CxQL-reference pages routed to their own files; "
+          f"{rstats['shell_pages']} section pages list their children, {rstats['accordions']} expandable "
+          f"sections unwrapped, {rstats['toggles_removed']} toggle lines removed; "
           f"{rstats['callouts']} callouts, {rstats['tables_as_lists']} tables as lists, "
           f"{rstats['links_internal']} internal links -> anchors, {rstats['links_live_site']} -> live site, "
           f"images: {rstats['images_removed']} removed, {rstats['images_kept_as_text']} kept as text, "
@@ -976,17 +1037,44 @@ def _anchor_of(rec: dict) -> str:
     return rec.get("anchor") or render.anchor_for(rec["file"])
 
 
-def _page_lines(rec: dict) -> list[str]:
-    """One page as an H3 block: title with a stable anchor, provenance line, body."""
+def _parse_date(text: str):
+    try:
+        return datetime.strptime((text or "").strip(), "%B %d, %Y")
+    except ValueError:
+        return None
+
+
+def _is_stale(rec: dict, months: int, now: datetime) -> bool:
+    d = _parse_date(rec.get("modified", ""))
+    return bool(months > 0 and d and (now - d).days > months * 30.44)
+
+
+def _flags_of(rec: dict, months: int, now: datetime) -> list[str]:
+    flags = []
+    if _is_stale(rec, months, now):
+        flags.append("stale")
+    if "Upcoming Features" in rec["breadcrumb"]:
+        flags.append("upcoming-section")
+    if rec.get("shell"):
+        flags.append("section-index")
+    return flags
+
+
+def _page_lines(rec: dict, months: int = 0, now: datetime | None = None) -> list[str]:
+    """One page as an H3 block: title with a stable anchor, a fixed header (Path,
+    Modified, Source, Flags; one `Key: value` per line), then the body."""
     meta = []
     if rec["breadcrumb"]:
-        meta.append(" › ".join(rec["breadcrumb"]))
+        meta.append(f"Path: {' › '.join(rec['breadcrumb'])}")
     if rec["modified"]:
         meta.append(f"Modified: {rec['modified']}")
     meta.append(f"Source: {rec['file']}")
+    flags = _flags_of(rec, months, now or datetime.now())
+    if flags:
+        meta.append(f"Flags: {', '.join(flags)}")
     return [
         f"### {_title_of(rec)} {{#{_anchor_of(rec)}}}\n",
-        f"_{' · '.join(meta)}_\n",
+        "  \n".join(meta) + "\n",
         _demote_headings(rec["markdown"]),
         "",
     ]
@@ -1013,12 +1101,8 @@ def _stale_lines(records: list[dict], months: int, now: datetime) -> list[str]:
         return []
     stale = []
     for r in records:
-        try:
-            d = datetime.strptime(r.get("modified", "").strip(), "%B %d, %Y")
-        except ValueError:
-            continue
-        if (now - d).days > months * 30.44:
-            stale.append((d, _title_of(r), _anchor_of(r)))
+        if _is_stale(r, months, now):
+            stale.append((_parse_date(r["modified"]), _title_of(r), _anchor_of(r)))
     if not stale:
         return []
     stale.sort()
@@ -1027,6 +1111,15 @@ def _stale_lines(records: list[dict], months: int, now: datetime) -> list[str]:
     lines += [f"- [{t}](#{a}) — {d:%B} {d.day}, {d.year}" for d, t, a in stale]
     lines.append("")
     return lines
+
+
+# Parts of the guide that get their own file: (page tag, file suffix, title suffix, why).
+PARTS = (
+    ("api", "api-reference", "API Reference Pages", "because they overlap the API spec job"),
+    ("cxql", "cxql-reference", "CxQL Reference Pages",
+     "because the CxQL method reference is large and rarely needed"),
+)
+PART_LABELS = {"api": "API-reference", "cxql": "CxQL-reference"}
 
 
 def _part_path(path: str, part: str) -> str:
@@ -1059,7 +1152,8 @@ def _doc_lines(cfg: SimpleNamespace, kept: list[dict], rescued: list[dict], titl
     if note:
         lines.append(f"_{note}_\n")
     lines += contents_lines(ordered, {p: len(by_product[p]) for p in ordered}, len(rescued))
-    lines += _stale_lines(kept + rescued, cfg.stale_months, datetime.now())
+    now = datetime.now()
+    lines += _stale_lines(kept + rescued, cfg.stale_months, now)
 
     for p in ordered:
         lines.append(f"## {p}\n")
@@ -1067,7 +1161,7 @@ def _doc_lines(cfg: SimpleNamespace, kept: list[dict], rescued: list[dict], titl
             lines.append(f"- [{_title_of(r)}](#{_anchor_of(r)})")
         lines.append("")
         for r in by_product[p]:
-            lines += _page_lines(r)
+            lines += _page_lines(r, cfg.stale_months, now)
 
     if rescued:
         lines.append("## Referenced Material\n")
@@ -1075,8 +1169,33 @@ def _doc_lines(cfg: SimpleNamespace, kept: list[dict], rescued: list[dict], titl
                      "by kept content (e.g. supported-language tables)._\n")
         rescued = sorted(rescued, key=lambda r: (r["product"], r["title"]))
         for r in rescued:
-            lines += _page_lines(r)
+            lines += _page_lines(r, cfg.stale_months, now)
     return lines
+
+
+def _index_path(md_path: str) -> str:
+    """docs/guide-2026-10-05.md -> docs/guide-2026-10-05-index.json"""
+    return f"{os.path.splitext(md_path)[0]}-index.json"
+
+
+def _index_json(cfg: SimpleNamespace, jobs: list) -> dict:
+    """A machine-readable map of every page in every output file, so an agent can
+    find a page (and the file it is in) without loading the guide."""
+    now = datetime.now()
+    pages, files = [], {}
+    for path, label, kept, rescued, _title, _note in jobs:
+        files[label] = os.path.basename(path)
+        for r in kept + rescued:
+            d = _parse_date(r.get("modified", ""))
+            pages.append({
+                "id": _anchor_of(r), "title": _title_of(r), "path": r["breadcrumb"],
+                "product": r["product"], "file": os.path.basename(path), "part": label,
+                "source": r["file"], "modified": d.strftime("%Y-%m-%d") if d else "",
+                "bytes": len("\n".join(_page_lines(r, cfg.stale_months, now)).encode("utf-8")),
+                "flags": _flags_of(r, cfg.stale_months, now), "aliases": sorted(r.get("aliases", [])),
+            })
+    return {"generated": time.strftime("%Y-%m-%d"), "source": cfg.url, "files": files,
+            "pages": sorted(pages, key=lambda p: (p["file"], p["id"]))}
 
 
 def _check_quality(text: str, label: str, limits: dict) -> tuple[dict, list[str]]:
@@ -1093,16 +1212,20 @@ def stage_combine(cfg: SimpleNamespace) -> None:
     kept_all = [r for r in records if r["status"] == "keep" and r.get("markdown")]
     resc_all = [r for r in records if r["status"] == "rescued" and r.get("markdown")]
 
-    api = [r for r in kept_all if r.get("part") == "api"]
-    main = [r for r in kept_all if r.get("part") != "api"]
-    api_path = _part_path(cfg.md_path, "api-reference")
-    note = (f"{len(api)} API-reference pages are in {os.path.basename(api_path)}, because they "
-            f"overlap the API spec job.") if api else ""
-    jobs = [(cfg.md_path, "main", main, resc_all, cfg.doc_title, note)]
-    if api:
-        jobs.append((api_path, "api-reference", api, [], f"{cfg.doc_title} — API Reference Pages",
-                     f"Split from {os.path.basename(cfg.md_path)}; links to pages in that file "
-                     f"point at docs.checkmarx.com."))
+    split = {pid: [r for r in kept_all if r.get("part") == pid] for pid, *_ in PARTS}
+    main = [r for r in kept_all if r.get("part") not in split]
+    notes = []
+    for pid, suffix, _, why in PARTS:
+        if split[pid]:
+            n = len(split[pid])
+            notes.append(f"{n} {PART_LABELS[pid]} {'page is' if n == 1 else 'pages are'} in "
+                         f"{os.path.basename(_part_path(cfg.md_path, suffix))}, {why}.")
+    jobs = [(cfg.md_path, "main", main, resc_all, cfg.doc_title, " ".join(notes))]
+    for pid, suffix, label, _ in PARTS:
+        if split[pid]:
+            jobs.append((_part_path(cfg.md_path, suffix), suffix, split[pid], [], f"{cfg.doc_title} — {label}",
+                         f"Split from {os.path.basename(cfg.md_path)}; links to pages in that file "
+                         f"point at docs.checkmarx.com."))
 
     totals: dict = {}
     failures: list[str] = []
@@ -1112,13 +1235,17 @@ def stage_combine(cfg: SimpleNamespace) -> None:
         size = os.path.getsize(path)
         metrics, failed = _check_quality(text, label, cfg.quality_limits)
         failures += failed
-        for k in ("dead_links", "broken_images", "h6_headings", "duplicate_ids"):
+        for k in ("dead_links", "broken_images", "h6_headings", "duplicate_ids", "toggle_leftovers"):
             totals[k] = totals.get(k, 0) + metrics[k]
         print(f"[combine] wrote {path} — {len(kept) + len(rescued)} pages, {size/1_048_576:.2f} MB")
         if metrics["dead_link_examples"]:
             print(f"[combine]   dead link examples: {', '.join(metrics['dead_link_examples'])}")
+    index_path = _index_path(cfg.md_path)
+    _write_text(index_path, json.dumps(_index_json(cfg, jobs), indent=1, ensure_ascii=False))
+    print(f"[combine] wrote {index_path}")
     print(f"[combine] quality: dead links {totals['dead_links']}, broken images {totals['broken_images']}, "
-          f"H6 headings {totals['h6_headings']}, duplicate ids {totals['duplicate_ids']}")
+          f"H6 headings {totals['h6_headings']}, duplicate ids {totals['duplicate_ids']}, "
+          f"toggle leftovers {totals['toggle_leftovers']}")
     if failures and not cfg.no_quality_gate:
         print("[combine] QUALITY GATE FAILED (the documents were written; "
               "pass --no-quality-gate to ignore):", file=sys.stderr)
@@ -1129,6 +1256,75 @@ def stage_combine(cfg: SimpleNamespace) -> None:
     if not cfg.keep_temp:        # the extract JSON is an intermediate, rebuilt by the next extract
         Path(cfg.json_path).unlink(missing_ok=True)
         print(f"[combine] removed temporary {cfg.json_path} (use --keep-temp to keep it)")
+
+
+# ===========================================================================
+# STAGES 5-8 — ANALYZE / VIEWS / ENRICH (built from the combined output on disk)
+# ===========================================================================
+
+def _spec_path() -> str:
+    return os.path.join(cx_api_spec.API_OUT_DIR, "cxone_openapi.json")
+
+
+def _resolve_guide(cfg: SimpleNamespace) -> str:
+    """Today's guide when combine has written it, else the newest dated guide that has a
+    page index next to it (so a monthly enrich run can happen on a different day)."""
+    if os.path.isfile(cx_docs_analysis.index_path(cfg.md_path)):
+        return cfg.md_path
+    stem = Path(cfg.md_path).stem[:-11]                       # drop "-YYYY-MM-DD"
+    folder = Path(cfg.md_path).parent
+    found = sorted(folder.glob(f"{stem}-????-??-??-index.json"))
+    if not found:
+        sys.exit(f"[guide] no combined guide with a page index in {folder} - run the combine stage first")
+    return str(found[-1])[: -len("-index.json")] + ".md"
+
+
+def stage_analyze(cfg: SimpleNamespace) -> None:
+    guide = _resolve_guide(cfg)
+    r = cx_docs_analysis.run(guide, _spec_path(), cfg.doc_title)
+    root = os.path.splitext(guide)[0]
+    print(f"[analyze] {r['pages']} pages: {r['clusters']} clusters of near-duplicate pages, {r['contained']} pages "
+          f"inside larger pages, {r['upcoming']} Upcoming pages that also exist as ordinary pages, "
+          f"{r['missing_api_paths']} API paths not in the spec")
+    print(f"[analyze] wrote {root}-clusters.json and {root}-review.md")
+
+
+def stage_views(cfg: SimpleNamespace) -> None:
+    guide = _resolve_guide(cfg)
+    r = cx_docs_views.run(guide, _spec_path(), title=cfg.doc_title)
+    root = os.path.splitext(guide)[0]
+    print(f"[views] {root}-reference.md {r['reference_bytes'] / 1024:.0f} KB "
+          f"({100 * r['reference_bytes'] / max(1, r['guide_bytes']):.1f}% of the guide), "
+          f"{root}-lookup.md {r['lookup_bytes'] / 1024:.0f} KB; "
+          f"{r['summaries']} of {r['pages']} pages have a checked summary")
+    if r["dead_links"]:
+        print(f"[views] QUALITY GATE FAILED: {r['dead_links']} links do not point at a guide page "
+              f"({', '.join(r['dead_examples'])})", file=sys.stderr)
+        if not cfg.no_quality_gate:
+            sys.exit(3)
+
+
+def stage_enrich_prep(cfg: SimpleNamespace) -> None:
+    guide = _resolve_guide(cfg)
+    r = cx_docs_enrich.prep(guide)
+    print(f"[enrich-prep] {r['pages']} pages: {r['to_enrich']} need a record in {r['batches']} batches "
+          f"({r['stubs']} short pages recorded without an LLM); estimated "
+          f"{r['est_input_tokens'] / 1000:.0f}K input and {r['est_output_tokens'] / 1000:.0f}K output tokens")
+    if r["to_enrich"]:
+        print(f"[enrich-prep] next: run /enrich-docs in Claude Code (batches are in {r['work_dir']}), "
+              f"then python cx_docs_mirror.py --stage enrich-check")
+    else:
+        print("[enrich-prep] nothing to do: every page has a current record")
+
+
+def stage_enrich_check(cfg: SimpleNamespace) -> None:
+    guide = _resolve_guide(cfg)
+    r = cx_docs_enrich.check(guide)
+    print(f"[enrich-check] stored {r['stored']} new records, rejected {r['rejected']}; companion has "
+          f"{r['companion_records']} of {r['pages']} pages ({r['missing']} without a current record) -> {r['companion']}")
+    if r["rejected"]:
+        print("[enrich-check] rejected records and the reasons are in enrich-work/rejected.json; "
+              "run --stage enrich-prep again to retry those pages")
 
 
 # ===========================================================================
@@ -1207,9 +1403,9 @@ def stage_compress(cfg: SimpleNamespace) -> None:
         if title_excluded(title, filters):
             dropped_title += 1
             return False
-        # Hash the body only — strip the leading _..._ provenance line so that
+        # Hash the body only — strip the leading provenance header (Path/Modified/Source/Flags lines, or the older _..._ line) so that
         # the same content served at different URLs dedupes despite differing Source:.
-        body = re.sub(r"^\s*_[^\n]*_\s*\n", "", block, count=1)
+        body = re.sub(r"^\s*(?:_[^\n]*_|(?:(?:Path|Modified|Source|Flags): [^\n]*\n)+)\s*\n", "", block, count=1)
         key = digest(body)
         if key in seen:
             dropped_dupe += 1
@@ -1299,6 +1495,7 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
         retry_cooldown=RETRY_COOLDOWN,
         images=pick(args.images, IMAGES),
         api_reference=pick(args.api_reference, API_REFERENCE),
+        cxql_reference=pick(getattr(args, "cxql_reference", None), CXQL_REFERENCE),
         stale_months=pick(args.stale_months, STALE_MONTHS),
         quality_limits=dict(QUALITY_LIMITS),
         no_quality_gate=args.no_quality_gate,
@@ -1312,10 +1509,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description="Checkmarx docs downloader: user docs (mirror -> extract -> combine) "
                     "and the Checkmarx One API spec (api-spec).")
-    ap.add_argument("--stage", choices=["mirror", "extract", "combine", "compress", "docs", "api-spec", "all"],
+    ap.add_argument("--stage", choices=["mirror", "extract", "combine", "compress", "analyze", "views",
+                                           "enrich-prep", "enrich-check", "docs", "api-spec", "all"],
                     default="all",
-                    help="Which stage to run. docs = mirror+extract+combine; "
-                         "all (default) = docs + api-spec")
+                    help="Which stage to run. docs = mirror+extract+combine+analyze+views; "
+                         "all (default) = docs + api-spec. enrich-prep / enrich-check wrap the "
+                         "/enrich-docs skill (LLM step) and are never part of docs or all")
     # overrides (all default None => fall back to CONFIG)
     ap.add_argument("--url")
     ap.add_argument("--include", nargs="*", help="Keep ONLY these product roots")
@@ -1342,6 +1541,8 @@ def main() -> None:
                     help="Images: strip (keep meaningful alt text) or rewrite to docs.checkmarx.com URLs")
     ap.add_argument("--api-reference", choices=["separate", "inline"],
                     help="Write API-reference pages to their own file (default) or keep them inline")
+    ap.add_argument("--cxql-reference", choices=["separate", "inline"],
+                    help="Write the CxQL method reference to its own file (default) or keep it inline")
     ap.add_argument("--stale-months", type=int, help="Front-matter index of pages not modified for N months (0 = off)")
     ap.add_argument("--no-quality-gate", action="store_true",
                     help="Do not fail combine when a quality metric exceeds its limit")
@@ -1356,7 +1557,8 @@ def main() -> None:
             sys.exit(f"[api-spec] FATAL: {e}")
 
     run_docs = args.stage in ("docs", "all")
-    if run_docs or args.stage in ("mirror", "extract", "combine", "compress"):
+    if run_docs or args.stage in ("mirror", "extract", "combine", "compress", "analyze", "views",
+                                  "enrich-prep", "enrich-check"):
         cfg = build_cfg(args)
         if args.stage == "mirror" or run_docs:
             stage_mirror(cfg)
@@ -1366,6 +1568,14 @@ def main() -> None:
             stage_combine(cfg)
         if args.stage == "compress":
             stage_compress(cfg)
+        if args.stage == "analyze" or run_docs:
+            stage_analyze(cfg)
+        if args.stage == "views" or run_docs:
+            stage_views(cfg)
+        if args.stage == "enrich-prep":
+            stage_enrich_prep(cfg)
+        if args.stage == "enrich-check":
+            stage_enrich_check(cfg)
     if args.stage in ("api-spec", "all"):
         sys.exit(cx_api_spec.run(cx_api_spec.build_cfg(args)))
 
