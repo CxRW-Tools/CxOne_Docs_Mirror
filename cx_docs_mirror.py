@@ -134,6 +134,15 @@ MAX_DEPTH = 3              # unused since the nav-driven mirror; kept for CLI co
 NAV_TIMEOUT_MS = 45000     # per-request HTTP timeout (ms)
 RETRIES = 3
 POLITE_WAIT = 0.3          # per-worker delay between pages (seconds)
+# Rate limiting (HTTP 429): every worker pauses together, honouring Retry-After
+# when the server sends it, then backing off 15s, 30s, 60s... up to 120s.
+RATE_LIMIT_RETRIES = 6
+RATE_LIMIT_BASE_DELAY = 15.0
+RATE_LIMIT_MAX_DELAY = 120.0
+RETRY_COOLDOWN = 20.0      # pause before the end-of-run retry pass over failed pages (seconds)
+# The mirror stops (exit 4, after writing its files) when more than this share of
+# pages could not be checked, so extract/combine never run on silently stale data.
+MAX_FAILURE_RATE = 0.02
 
 # --- Output paths -----------------------------------------------------------
 # Every user-docs output lives under DOCS_DIR (the API stage writes only to api/).
@@ -334,6 +343,16 @@ HTTP_HEADERS = {
 }
 
 
+def _failure_problem(failures: list, total: int, cfg: SimpleNamespace) -> str | None:
+    """A message when too many pages could not be checked, else None."""
+    limit = cfg.max_failure_rate
+    if limit is None or total == 0 or len(failures) / total <= limit:
+        return None
+    return (f"{len(failures)} of {total} pages ({100 * len(failures) / total:.1f}%) could not be checked, "
+            f"more than the {100 * limit:.1f}% allowed. The files were written, but extract/combine would "
+            f"run on stale copies. Re-run later, or raise --max-failure-rate")
+
+
 def stage_mirror(cfg: SimpleNamespace) -> None:
     asyncio.run(_mirror(cfg))
 
@@ -406,18 +425,50 @@ def _discover_from_nav(html: str, cfg: SimpleNamespace) -> tuple[dict[str, str],
     return urls, seen_products
 
 
+def _retry_after(r) -> float | None:
+    """Seconds from a Retry-After header (the numeric form), capped; None if absent."""
+    try:
+        return min(float(r.headers.get("retry-after", "")), 300.0)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 async def _http_get(client, url: str, cfg: SimpleNamespace, headers: dict):
-    """GET with retries and backoff on network errors, 429, 403 and 5xx."""
-    last_exc = None
-    for attempt in range(cfg.retries):
+    """GET with retries and backoff on network errors, 403 and 5xx. A 429 pauses
+    EVERY worker (shared cfg.rate), honours Retry-After, and has its own, longer
+    retry budget; the per-page delay also grows a little for the rest of the run."""
+    rate = getattr(cfg, "rate", None)
+    loop = asyncio.get_running_loop()
+    last_exc, attempt, throttled = None, 0, 0
+    while True:
+        if rate is not None and rate["until"] > loop.time():
+            await asyncio.sleep(rate["until"] - loop.time())
         try:
             r = await client.get(url, headers=headers)
             if r.status_code in (200, 304, 404, 410):
                 return r
+            if r.status_code == 429:
+                throttled += 1
+                last_exc = "HTTP 429"
+                if throttled > RATE_LIMIT_RETRIES:
+                    break
+                delay = _retry_after(r) or min(RATE_LIMIT_MAX_DELAY,
+                                               RATE_LIMIT_BASE_DELAY * 2 ** (throttled - 1))
+                if rate is not None:
+                    if rate["until"] <= loop.time():
+                        print(f"      rate limited (429): pausing all requests for {delay:.0f}s")
+                    rate["until"] = max(rate["until"], loop.time() + delay)
+                    rate["extra"] = min(2.0, rate["extra"] + 0.25)
+                else:
+                    await asyncio.sleep(delay)
+                continue
             last_exc = f"HTTP {r.status_code}"
         except Exception as e:                       # httpx.TransportError etc.
             last_exc = f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
-        await asyncio.sleep(2 * (attempt + 1))
+        attempt += 1
+        if attempt >= cfg.retries:
+            break
+        await asyncio.sleep(2 * attempt)
     print(f"      giving up on {url}: {last_exc}", file=sys.stderr)
     return None
 
@@ -436,7 +487,7 @@ async def _process(url: str, product: str, client, cfg, out_dir: Path, state: di
             headers["If-Modified-Since"] = prev["last_modified"]
 
         r = await _http_get(client, url, cfg, headers)
-        await asyncio.sleep(cfg.wait)
+        await asyncio.sleep(cfg.wait + (getattr(cfg, "rate", None) or {}).get("extra", 0.0))
 
         if r is None or r.status_code in (404, 410):
             stats["failed"] += 1
@@ -557,9 +608,22 @@ async def _mirror(cfg: SimpleNamespace) -> None:
         failures: list[str] = []
         manifest: list[str] = []
         sem = asyncio.Semaphore(cfg.concurrency)
+        cfg.rate = {"until": 0.0, "extra": 0.0}
         await asyncio.gather(*[
             _process(u, p, client, cfg, out_dir, state, sem, stats, changes, failures, manifest)
             for u, p in items])
+
+        if failures and cfg.retry_cooldown >= 0:
+            retry = list(failures)
+            print(f"[mirror] {len(retry)} pages could not be checked; retrying them once "
+                  f"after a {cfg.retry_cooldown:.0f}s cool-down")
+            await asyncio.sleep(cfg.retry_cooldown)
+            failures.clear()
+            stats["failed"] -= len(retry)
+            product_of = dict(items)
+            for u in retry:
+                await _process(u, product_of[u], client, cfg, out_dir, state, sem, stats,
+                               changes, failures, manifest)
 
     for position, (u, _) in enumerate(items):      # sidebar order, used to sort the combined document
         if u in state:
@@ -592,7 +656,15 @@ async def _mirror(cfg: SimpleNamespace) -> None:
           f"stale cached files ignored by extract: {len(stale)}")
     print(f"[mirror] wrote {manifest_path.name}, {state_path.name}, {report.name}")
     if stats["new"] + stats["updated"] == 0:
-        print("[mirror] no content changes detected this run.")
+        print("[mirror] no content changes detected" + (
+            f" among the {len(items) - len(failures)} pages that could be checked." if failures else "."))
+    problem = _failure_problem(failures, len(items), cfg)
+    if problem:
+        print(f"[mirror] ERROR: {problem}", file=sys.stderr)
+        sys.exit(4)
+    if failures:
+        print(f"[mirror] WARNING: {len(failures)} pages could not be checked; their cached copies "
+              f"are used (see failures.log)", file=sys.stderr)
 
 
 # ===========================================================================
@@ -1214,6 +1286,8 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
         md_path=_dated_path(pick(args.md_path, CANONICAL_MD)),
         md_out=args.md_out,
         keep_temp=args.keep_temp,
+        max_failure_rate=pick(args.max_failure_rate, MAX_FAILURE_RATE),
+        retry_cooldown=RETRY_COOLDOWN,
         images=pick(args.images, IMAGES),
         api_reference=pick(args.api_reference, API_REFERENCE),
         stale_months=pick(args.stale_months, STALE_MONTHS),
@@ -1244,6 +1318,9 @@ def main() -> None:
     ap.add_argument("--timeout", type=int)
     ap.add_argument("--retries", type=int)
     ap.add_argument("--wait", type=float)
+    ap.add_argument("--max-failure-rate", type=float,
+                    help="Mirror exits 4 when more than this share of pages could not be checked "
+                         f"(default {MAX_FAILURE_RATE}; 1 disables)")
     ap.add_argument("--max-pages", type=int)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--html-dir")

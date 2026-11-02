@@ -36,6 +36,7 @@ Useful flags:
 | `--images strip\|absolute` | docs: drop images (keeping meaningful alt text, the default) or rewrite them to docs.checkmarx.com URLs |
 | `--api-reference separate\|inline` | docs: write API-reference pages to their own file (default) or keep them inline |
 | `--stale-months N` | docs: front-matter index of pages not modified for N months (default 18, 0 = off) |
+| `--max-failure-rate F` | docs: the mirror exits 4 (after writing its files) when more than this share of pages could not be checked (default 0.02; 1 disables) |
 | `--no-quality-gate` | docs: do not fail combine (exit 3) when a quality metric exceeds its limit |
 | `--baseline FILE` | API: diff against your current spec |
 | `--overlay DIR` | API: hand-maintained operations neither source has (default `api/overlay/`) |
@@ -119,6 +120,8 @@ Every transformation below is deterministic: the same cached HTML always gives t
 | Order | Pages follow the site navigation order recorded by the mirror stage, not the alphabet. Run the mirror stage once to record it. |
 | API reference | Pages under a breadcrumb matching `API_REFERENCE_CRUMBS` go to `...-api-reference.md`. |
 | Staleness | The front matter lists pages last modified more than `--stale-months` months ago, oldest first. |
+
+The mirror is polite about rate limits. On HTTP 429 every worker pauses together, using the server's `Retry-After` when it sends one and otherwise backing off 15s, 30s, 60s (up to 120s), and the per-page delay grows a little for the rest of the run. Pages that still fail get one more try after a short cool-down. If more than 2% of pages still cannot be checked, the mirror exits with code 4 after writing its files, so extract and combine never run on silently stale copies. A page that fails keeps its cached copy, and `failures.log` lists it.
 
 At the end of combine a quality line is printed: dead links, broken images, H6 headings, duplicate ids. `QUALITY_LIMITS` in `cx_docs_mirror.py` sets the limits; dead links, broken images and duplicate ids must be 0 or combine exits with code 3 (after writing the files, and keeping `cx-extracted.json` for inspection). H6 headings are reported only. Use `--no-quality-gate` to ignore the limits.
 

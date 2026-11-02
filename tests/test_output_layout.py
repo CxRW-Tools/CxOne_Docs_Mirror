@@ -31,6 +31,7 @@ def docs_args(*extra):
     ap.add_argument("--images")
     ap.add_argument("--api-reference")
     ap.add_argument("--wait", type=float)
+    ap.add_argument("--max-failure-rate", type=float)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--keep-temp", action="store_true")
     ap.add_argument("--no-quality-gate", action="store_true")
