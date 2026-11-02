@@ -6,7 +6,9 @@ Everything here is pure and repeatable: the same cached HTML always gives the
 same Markdown. It exists to fix defects that a generic HTML-to-Markdown
 converter leaves behind:
 
-  - admonitions (Note / Tip / Warning ...) become blockquotes, not stray headings
+  - admonitions (Note / Tip / Warning ...) become blockquotes, not stray headings;
+    expandable (accordion) sections become a bold title plus ordinary content, and
+    "Expand source" toggle text is dropped
   - nested tables and tables with block content (lists, code, several
     paragraphs) become definition-list style sections instead of mangled pipes
   - images are stripped (keeping meaningful alt text) or made absolute; a
@@ -141,6 +143,37 @@ def _blockquote(div: Tag, label: str) -> Tag:
     return bq
 
 
+def _accordion(div: Tag) -> None:
+    """An expandable section is content, not a callout: its title becomes a bold
+    lead-in and its body is unwrapped in place, so it is not buried in a blockquote."""
+    title = div.find(class_="sidebar-title")
+    body = div.find(class_="panel-body")
+    label = " ".join(title.get_text(" ", strip=True).split()) if title else ""
+    nodes: list = []
+    if label:
+        lead = _tag("p")
+        strong = _tag("strong")
+        strong.string = label
+        lead.append(strong)
+        nodes.append(lead)
+    if body is not None:
+        nodes += list(body.contents)
+    for node in nodes:
+        div.insert_before(node.extract() if node.parent is not None else node)
+    div.decompose()
+
+
+# Text of the show/hide controls that the site's scripts normally turn into buttons.
+TOGGLE_TEXT = ("expand source", "collapse source")
+
+
+def _toggles(sec: Tag, ctx: RenderCtx) -> None:
+    for p in sec.find_all("p"):
+        if p.get_text(strip=True).lower() in TOGGLE_TEXT:
+            p.decompose()
+            ctx.stats["toggles_removed"] += 1
+
+
 def _admonitions(sec: Tag, ctx: RenderCtx) -> None:
     for div in reversed(sec.find_all("div")):                 # innermost first
         classes = div.get("class") or []
@@ -152,6 +185,9 @@ def _admonitions(sec: Tag, ctx: RenderCtx) -> None:
                 title.decompose()
             div.replace_with(_blockquote(div, label or kind.capitalize()))
             ctx.stats["callouts"] += 1
+        elif "sidebar" in classes and "accordion" in classes:
+            _accordion(div)
+            ctx.stats["accordions"] += 1
         elif "sidebar" in classes:
             title = div.find(class_="sidebar-title")
             if title is None:
@@ -295,8 +331,11 @@ def _links(sec: Tag, ctx: RenderCtx) -> None:
 
 
 def is_empty(section: Tag, images: str = "strip") -> bool:
-    """A topic with no words (and, in absolute mode, no images) renders to nothing."""
-    if section.get_text(strip=True):
+    """A topic with no words beyond its own title (and, in absolute mode, no images)
+    renders to nothing, because the page title is dropped from the body."""
+    h1 = section.find("h1")
+    title = h1.get_text(strip=True) if h1 else ""
+    if section.get_text(strip=True).replace(title, "", 1).strip():
         return False
     return not (images == "absolute" and section.find("img"))
 
@@ -315,6 +354,7 @@ def prepare(section: Tag, ctx: RenderCtx) -> Tag:
     for el in sec.find_all(["script", "style"]):
         el.decompose()
     _images(sec, ctx)
+    _toggles(sec, ctx)
     _admonitions(sec, ctx)
     _tables(sec, ctx)
     _links(sec, ctx)
@@ -375,7 +415,9 @@ def quality_metrics(text: str, heading_slug) -> dict:
     dead_links     in-document `#anchor` links with no target, and relative `.html` links
     broken_images  image references that are not absolute URLs
     h6_headings    lines at the deepest ATX level
-    duplicate_ids  `{#p-...}` anchors defined more than once"""
+    duplicate_ids  `{#p-...}` anchors defined more than once
+    blockquote_pct share of the document that sits on `>` lines (report only)
+    toggle_leftovers  "Expand source" style control text that should have been dropped"""
     lines, in_code, body = text.split("\n"), False, []
     for ln in lines:
         if _FENCE.match(ln):
@@ -397,7 +439,11 @@ def quality_metrics(text: str, heading_slug) -> dict:
         elif not urlparse(target).scheme and target.split("#")[0].endswith(".html"):
             dead.append(target)
     counts = Counter(anchors)
+    total = len(text.encode("utf-8")) or 1
+    quoted = sum(len(ln.encode("utf-8")) + 1 for ln in body if ln.startswith(">"))
     return {
+        "blockquote_pct": round(100 * quoted / total, 1),
+        "toggle_leftovers": sum(1 for ln in body if ln.strip().lower().lstrip("> ") in TOGGLE_TEXT),
         "dead_links": len(dead), "dead_link_examples": sorted(set(dead))[:5],
         "broken_images": broken,
         "h6_headings": sum(1 for ln in body if ln.startswith("###### ")),
