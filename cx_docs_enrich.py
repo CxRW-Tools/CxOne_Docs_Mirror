@@ -1,7 +1,7 @@
 """
 cx_docs_enrich.py — the deterministic half of the per-page enrichment layer.
 
-An LLM (run by the /enrich-docs skill in Claude Code) writes a short record for
+An LLM (run by the /cxone-mirror-docs skill in Claude Code) writes a short record for
 each page: what it is, where it lives, how it is run. This module does everything
 around that call, so the LLM output can be trusted only as far as it checks out:
 

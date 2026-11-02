@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -219,6 +220,24 @@ class Layers(unittest.TestCase):
     def test_cli_command_extraction_stops_at_the_first_flag_or_argument(self):
         page = {"body": "```\n./cx scan create --project-name x\ncx utils env\nnot cx here\n```\ncx outside code\n"}
         self.assertEqual(V.cli_commands(page), {"cx scan create", "cx utils env"})
+
+
+class StaleGuideWarningTests(unittest.TestCase):
+    TODAY = date(2026, 11, 2)
+
+    def test_old_guide_warns_with_age_and_the_refresh_commands(self):
+        msg = D._stale_guide_warning("docs/checkmarx-one-docs-2026-10-20.md", 7, self.TODAY)
+        self.assertIn("13 days old", msg)
+        self.assertIn("--stage docs", msg)
+        self.assertIn("--refresh", msg)
+
+    def test_recent_guide_and_age_limit_zero_do_not_warn(self):
+        self.assertEqual(D._stale_guide_warning("docs/checkmarx-one-docs-2026-10-30.md", 7, self.TODAY), "")
+        self.assertEqual(D._stale_guide_warning("docs/checkmarx-one-docs-2026-01-01.md", 0, self.TODAY), "")
+
+    def test_a_guide_name_without_a_date_is_never_flagged(self):
+        self.assertIsNone(D._guide_age_days("docs/guide.md", self.TODAY))
+        self.assertEqual(D._stale_guide_warning("docs/guide.md", 7, self.TODAY), "")
 
 
 if __name__ == "__main__":

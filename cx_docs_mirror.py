@@ -16,7 +16,7 @@ that write to separate outputs:
     5. ANALYZE   Cluster near-duplicate pages, flag Upcoming pages that also exist
                  as ordinary pages and API paths missing from the spec (no LLM).
     6. VIEWS     Compact reference view and lookup tables for agents (no LLM).
-    7. ENRICH    Optional, run by the /enrich-docs skill: per-page summaries and
+    7. ENRICH    Optional, run by the /cxone-mirror-docs skill: per-page summaries and
                  aliases in a separate companion file, checked against the source.
 
   API SPEC   (live tenant catalog + Stoplight -> one OpenAPI 3.0.3 candidate)
@@ -37,7 +37,7 @@ Run everything (default), or any part in isolation:
     python cx_docs_mirror.py --stage compress
     python cx_docs_mirror.py --stage analyze       # clusters + review report from the combined guide
     python cx_docs_mirror.py --stage views         # compact reference view + lookup tables
-    python cx_docs_mirror.py --stage enrich-prep   # LLM step 1/3 (then /enrich-docs, then enrich-check)
+    python cx_docs_mirror.py --stage enrich-prep   # LLM step 1/3 (then /cxone-mirror-docs, then enrich-check)
     python cx_docs_mirror.py --stage api-spec --baseline path/to/cxone_openapi.json
 
 All knobs live in the CONFIG block below (target URL, what to include/exclude,
@@ -65,7 +65,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urldefrag, urljoin, urlparse
@@ -160,6 +160,7 @@ RETRY_COOLDOWN = 20.0      # pause before the end-of-run retry pass over failed 
 # The mirror stops (exit 4, after writing its files) when more than this share of
 # pages could not be checked, so extract/combine never run on silently stale data.
 MAX_FAILURE_RATE = 0.02
+ENRICH_MAX_GUIDE_AGE_DAYS = 7     # enrich-prep warns when the guide it reads is older than this (0 = off)
 
 # --- Output paths -----------------------------------------------------------
 # Every user-docs output lives under DOCS_DIR (the API stage writes only to api/).
@@ -1275,7 +1276,7 @@ def _resolve_guide(cfg: SimpleNamespace) -> str:
     folder = Path(cfg.md_path).parent
     found = sorted(folder.glob(f"{stem}-????-??-??-index.json"))
     if not found:
-        sys.exit(f"[guide] no combined guide with a page index in {folder} - run the combine stage first")
+        sys.exit(f"[guide] no combined guide with a page index in {folder} - run --stage docs first (or add --refresh to enrich-prep)")
     return str(found[-1])[: -len("-index.json")] + ".md"
 
 
@@ -1304,14 +1305,38 @@ def stage_views(cfg: SimpleNamespace) -> None:
             sys.exit(3)
 
 
+def _guide_age_days(guide: str, today: date | None = None) -> int | None:
+    """Days since the date in the guide's file name (`...-YYYY-MM-DD.md`), or None if it has none."""
+    m = re.search(r"-(\d{4}-\d{2}-\d{2})$", Path(guide).stem)
+    if not m:
+        return None
+    try:
+        return ((today or date.today()) - date.fromisoformat(m.group(1))).days
+    except ValueError:
+        return None
+
+
+def _stale_guide_warning(guide: str, max_age_days: int, today: date | None = None) -> str:
+    """One warning line when the guide is older than max_age_days, else an empty string."""
+    age = _guide_age_days(guide, today)
+    if not max_age_days or age is None or age <= max_age_days:
+        return ""
+    return (f"[enrich-prep] WARNING: the guide is {age} days old ({Path(guide).name}); records will describe "
+            f"old pages. Refresh it first: python cx_docs_mirror.py --stage docs (network, no AI usage), "
+            f"or rerun this stage with --refresh")
+
+
 def stage_enrich_prep(cfg: SimpleNamespace) -> None:
     guide = _resolve_guide(cfg)
+    warn = _stale_guide_warning(guide, cfg.max_guide_age_days)
+    if warn:
+        print(warn, file=sys.stderr)
     r = cx_docs_enrich.prep(guide)
     print(f"[enrich-prep] {r['pages']} pages: {r['to_enrich']} need a record in {r['batches']} batches "
           f"({r['stubs']} short pages recorded without an LLM); estimated "
           f"{r['est_input_tokens'] / 1000:.0f}K input and {r['est_output_tokens'] / 1000:.0f}K output tokens")
     if r["to_enrich"]:
-        print(f"[enrich-prep] next: run /enrich-docs in Claude Code (batches are in {r['work_dir']}), "
+        print(f"[enrich-prep] next: run /cxone-mirror-docs in Claude Code (batches are in {r['work_dir']}), "
               f"then python cx_docs_mirror.py --stage enrich-check")
     else:
         print("[enrich-prep] nothing to do: every page has a current record")
@@ -1497,6 +1522,7 @@ def build_cfg(args: argparse.Namespace) -> SimpleNamespace:
         api_reference=pick(args.api_reference, API_REFERENCE),
         cxql_reference=pick(getattr(args, "cxql_reference", None), CXQL_REFERENCE),
         stale_months=pick(args.stale_months, STALE_MONTHS),
+        max_guide_age_days=pick(getattr(args, "max_guide_age_days", None), ENRICH_MAX_GUIDE_AGE_DAYS),
         quality_limits=dict(QUALITY_LIMITS),
         no_quality_gate=args.no_quality_gate,
         title_exclude=pick(args.title_exclude, TITLE_EXCLUDE_PATTERNS),
@@ -1513,8 +1539,8 @@ def main() -> None:
                                            "enrich-prep", "enrich-check", "docs", "api-spec", "all"],
                     default="all",
                     help="Which stage to run. docs = mirror+extract+combine+analyze+views; "
-                         "all (default) = docs + api-spec. enrich-prep / enrich-check wrap the "
-                         "/enrich-docs skill (LLM step) and are never part of docs or all")
+                         "all (default) = api-spec, then docs (exits with the api-spec code if the docs succeed). enrich-prep / enrich-check wrap the "
+                         "/cxone-mirror-docs skill (LLM step) and are never part of docs or all")
     # overrides (all default None => fall back to CONFIG)
     ap.add_argument("--url")
     ap.add_argument("--include", nargs="*", help="Keep ONLY these product roots")
@@ -1544,6 +1570,11 @@ def main() -> None:
     ap.add_argument("--cxql-reference", choices=["separate", "inline"],
                     help="Write the CxQL method reference to its own file (default) or keep it inline")
     ap.add_argument("--stale-months", type=int, help="Front-matter index of pages not modified for N months (0 = off)")
+    ap.add_argument("--refresh", action="store_true",
+                    help="enrich-prep: rebuild the docs first (mirror, extract, combine, analyze, views). "
+                         "Needs the network, uses no AI")
+    ap.add_argument("--max-guide-age-days", type=int,
+                    help=f"enrich-prep: warn when the guide is older than this (default {ENRICH_MAX_GUIDE_AGE_DAYS}; 0 = off)")
     ap.add_argument("--no-quality-gate", action="store_true",
                     help="Do not fail combine when a quality metric exceeds its limit")
     ap.add_argument("--keep-temp", action="store_true",
@@ -1556,7 +1587,12 @@ def main() -> None:
         except cx_api_spec.FatalError as e:
             sys.exit(f"[api-spec] FATAL: {e}")
 
-    run_docs = args.stage in ("docs", "all")
+    api_code = 0
+    if args.stage in ("api-spec", "all"):          # before the docs: analyze checks the guide's API paths against this spec
+        api_code = cx_api_spec.run(cx_api_spec.build_cfg(args))
+        if args.stage == "api-spec":
+            sys.exit(api_code)
+    run_docs = args.stage in ("docs", "all") or (args.stage == "enrich-prep" and args.refresh)
     if run_docs or args.stage in ("mirror", "extract", "combine", "compress", "analyze", "views",
                                   "enrich-prep", "enrich-check"):
         cfg = build_cfg(args)
@@ -1576,8 +1612,7 @@ def main() -> None:
             stage_enrich_prep(cfg)
         if args.stage == "enrich-check":
             stage_enrich_check(cfg)
-    if args.stage in ("api-spec", "all"):
-        sys.exit(cx_api_spec.run(cx_api_spec.build_cfg(args)))
+    sys.exit(api_code)
 
 
 if __name__ == "__main__":

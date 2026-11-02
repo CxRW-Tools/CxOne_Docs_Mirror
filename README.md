@@ -20,7 +20,7 @@ python -m pip install -r requirements.txt
 ## Usage
 
 ```bash
-python cx_docs_mirror.py                      # user docs + API spec
+python cx_docs_mirror.py                      # API spec, then user docs (the docs analysis checks API paths against the new spec)
 python cx_docs_mirror.py --stage docs         # mirror -> extract -> combine -> analyze -> views
 python cx_docs_mirror.py --stage api-spec --baseline path/to/cxone_openapi.json
 python cx_docs_mirror.py --help               # every flag
@@ -66,8 +66,8 @@ docs/                                   user docs (generated, gitignored)
   checkmarx-one-docs-<date>-review.md
   checkmarx-one-docs-<date>-reference.md
   checkmarx-one-docs-<date>-lookup.md
-  checkmarx-one-docs-<date>-companion.jsonl     only after /enrich-docs
-  enrich-cache/, enrich-work/                   only after /enrich-docs
+  checkmarx-one-docs-<date>-companion.jsonl     only after /cxone-mirror-docs
+  enrich-cache/, enrich-work/                   only after /cxone-mirror-docs
   changes-<date>.md
   mirror-state.json
   manifest.json
@@ -155,16 +155,20 @@ The guide stays a faithful, deterministic mirror. Everything below is built from
 - `views` writes the reference view and the lookup tables. Every link must point at a page in the guide, or `views` exits with code 3 (`--no-quality-gate` ignores that). Without a companion, summaries are the first sentence of the page.
 - Rebuilding from the same cached pages gives byte-identical files.
 
-**LLM step (optional, monthly, run in Claude Code).** `enrich-prep` finds pages whose record is missing or out of date and writes batches; the `/enrich-docs` skill (`.claude/skills/enrich-docs/`) has subagents write a record per page; `enrich-check` validates and stores them and rebuilds `...-companion.jsonl`; then run `views` again.
+**LLM step (optional, monthly, run in Claude Code).** `enrich-prep` finds pages whose record is missing or out of date and writes batches; the `/cxone-mirror-docs` skill (`.claude/skills/cxone-mirror-docs/`) has subagents write a record per page; `enrich-check` validates and stores them and rebuilds `...-companion.jsonl`; then run `views` again.
 
 ```bash
-python cx_docs_mirror.py --stage enrich-prep    # cost estimate and batches
-# in Claude Code: /enrich-docs
+python cx_docs_mirror.py --stage enrich-prep    # cost estimate and batches (add --refresh to rebuild the docs first)
+# in Claude Code: /cxone-mirror-docs
 python cx_docs_mirror.py --stage enrich-check   # validate, cache, rebuild the companion
 python cx_docs_mirror.py --stage views
 ```
 
 A record is stored only if every number, quoted span, flag, URL, path, command, menu entry and name-like token (CamelCase, ALL CAPS, snake_case) in it also appears on the source page, aliases appear on the page (or in the optional, hand-written `docs-synonyms.json`, `{"term": ["alias"]}`), and `variant_of` comes from the clusters, not the LLM. Failures are listed in `docs/enrich-work/rejected.json` and retried once; a page without a record just falls back to its first sentence.
+
+`enrich-prep` warns when the guide it reads is older than `--max-guide-age-days` (default 7; 0 turns it off), because the records would describe old pages. `--refresh` runs mirror, extract, combine, analyze and views first, then prepares the batches; it needs the network but uses no AI. The skill asks before refreshing.
+
+**Everything from Claude Code.** After a fresh clone you can skip the terminal: open the repo in Claude Code and run `/cxone-mirror-docs`. It brings every output up to date: it checks for Python and the libraries in `requirements.txt` (and asks before installing them), fetches the API spec (optionally against your `--baseline` and `--used-endpoints`), downloads or refreshes the docs, and then does the enrichment. It states its plan and asks once before fetching (network, no AI), and again before a large enrichment. It never handles credentials: for `--auth-token-env` you set the variable yourself and the skill passes only its name. You can limit the scope, for example "just the API spec" or "docs only, no enrichment".
 
 Records are cached by page text, prompt version and, for a variant, the canonical page's text. A month with no changed pages makes no LLM calls and rewrites the companion identically. Bump `PROMPT_VERSION` in `cx_docs_enrich.py` when you change the prompt (this re-runs every page). Cost: a 16-page pilot used about 3.5 billed tokens per token of page text, which is what `enrich-prep` uses for its estimate; expect roughly 2.8M tokens for the first full run and a few hundred thousand for a monthly one. No credentials are involved.
 
