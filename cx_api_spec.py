@@ -231,6 +231,15 @@ def iter_ops(doc: dict):
                 yield path, m, op, item.get("parameters")
 
 
+CONSUMER_VERBS = ("get", "post", "put", "patch", "delete")
+
+
+def count_consumer_ops(doc: dict) -> int:
+    """Operations as a consumer counts them: GET/POST/PUT/PATCH/DELETE under paths.
+    HEAD (and any other method) stays in the spec but is not counted in the report."""
+    return sum(1 for _, m, _, _ in iter_ops(doc) if m in CONSUMER_VERBS)
+
+
 def server_prefix(url) -> str | None:
     """Gateway prefix from a `servers[].url`. None when it isn't a usable path."""
     if not isinstance(url, str) or not url.strip():
@@ -1938,15 +1947,18 @@ def write_report(path: Path, drift: dict, manifest: dict, run_date: str,
     c = manifest["counts"]
     src = manifest["sources"]
     L = [f"# Checkmarx One API spec - sync report ({run_date})", "",
-         f"- **Merged spec:** {c['paths']} paths, {c['operations']} operations "
-         f"(live {c['by_source'].get('live', 0)}, both {c['by_source'].get('both', 0)}, "
-         f"Stoplight-only {c['by_source'].get('stoplight', 0)}, overlay {c['by_source'].get('overlay', 0)}).",
+         f"- **Merged spec:** {c['paths']} paths, {c['operations_consumer']} operations "
+         f"(GET/POST/PUT/PATCH/DELETE; {c['operations'] - c['operations_consumer']} HEAD operations also in the file, not counted). "
+         f"By source, all methods: live {c['by_source'].get('live', 0)}, both {c['by_source'].get('both', 0)}, "
+         f"Stoplight-only {c['by_source'].get('stoplight', 0)}, overlay {c['by_source'].get('overlay', 0)}.",
          f"- **Sources:** live catalog {src['live']['base_url']} "
          f"({src['live']['services']} services, {src['live']['operations']} ops); "
          f"Stoplight ({src['stoplight']['services']} services, {src['stoplight']['operations']} ops).",
          f"- **Baseline:** {baseline_label or 'none given - baseline-dependent categories are empty'}"
          + (f" ({drift['baseline_operations']} ops)." if drift["baseline_operations"] is not None else "."),
          f"- **Validation:** {manifest['validation']['summary']}", ""]
+    if not baseline_label:
+        L[2:2] = ["> **WARNING:** No baseline: removed/changed/deprecation-new and shrink-guard checks did not run.", ""]
     g = drift.get("shrink_guard") or {}
     if g.get("fired"):
         L += ["## SHRINK GUARD FIRED" + (" (overridden by --allow-shrink)" if g["overridden"]
@@ -2066,7 +2078,8 @@ def build_manifest(res: dict, raw: RawSet, drift: dict, validation: dict, cfg, r
               for rel, e in sorted(raw.entries.items()) if e.get("status") != "ok"}
     return {
         "run_date": run_date,
-        "counts": {"paths": len(res["doc"]["paths"]), "operations": len(merged), "by_source": by_source,
+        "counts": {"paths": len(res["doc"]["paths"]), "operations": len(merged),
+                   "operations_consumer": count_consumer_ops(res["doc"]), "by_source": by_source,
                    "components": {k: len(v) for k, v in res["doc"]["components"].items()}},
         "sources": {
             "live": {"base_url": cfg.base_url, "services": len(lives), "extra_services": len(extras),

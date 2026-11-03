@@ -163,6 +163,14 @@ class Merge(unittest.TestCase):
         self.assertTrue(op["x-live-missing"])
         self.assertNotIn("x-live-verified", op)
 
+    def test_consumer_count_uses_five_verbs_only(self):
+        doc = {"paths": {
+            "/a": {"get": {}, "post": {}, "head": {}, "parameters": [{"name": "x"}]},
+            "/b": {"put": {}, "patch": {}, "delete": {}, "options": {}},
+        }}
+        self.assertEqual(A.count_consumer_ops(doc), 5)
+        self.assertEqual(len(list(A.iter_ops(doc))), 7)   # iter_ops still sees HEAD and OPTIONS
+
     def test_valid_shape(self):
         self.assertEqual(self.doc["openapi"], "3.0.3")
         self.assertEqual(A.dangling_refs(self.doc), [])
