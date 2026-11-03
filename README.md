@@ -243,13 +243,37 @@ If you use `--auth-token-env`, it needs an already-issued bearer token, and `--a
 
 ### Adopting the output
 
-The adoption procedure lives in the consumer repo: see "Refreshing the spec" in [`spec/CLEANUP_NOTES.md`](https://github.com/CxRW-Tools/CxOne_Multi-Tool/blob/main/spec/CLEANUP_NOTES.md).
+The adoption procedure lives in the consumer repo: see "Refreshing the spec" in [`spec/CLEANUP_NOTES.md`](https://github.com/CxRW-Tools/CxOne_Multi-Tool/blob/main/.claude/skills/checkmarx-one-multi-tool/spec/CLEANUP_NOTES.md).
 
 ### Resetting `history.json`
 
 The easy way is `--fresh` (see Usage): it ignores the saved history and cached downloads for that run and rebuilds them, so nothing has to be deleted by hand. Files that a sync client (OneDrive) refuses to delete are reported and ignored.
 
 `history.json` records per-operation signatures, so a change to placement logic can leave spurious `removed_candidate` entries behind. Its format carries a version; a file written by an older version is ignored automatically (the run notes it) and a fresh history starts. To reset by hand, delete `api/history.json`.
+
+## Consumers
+
+The CxOne Multi-Tool (`CxRW-Tools/CxOne_Multi-Tool`) reads this repo's API spec output. It relies on:
+
+- **Flags:** `--stage api-spec` (through `cx_docs_mirror.py`), `--baseline`, `--used-endpoints`, `--auth-token-env`.
+- **Exit codes:** `0` success, `1` fatal (a source was unreachable), `10` breaking drift on an endpoint in `--used-endpoints`, `11` the shrink guard fired and `api/cxone_openapi.json` was not written.
+- **Output files:** `api/cxone_openapi.json` (the spec) and `api/API-SPEC-REPORT.md` (the report).
+- **Operation fields:** `x-source`, `x-service`, `x-gateway-prefix`, `x-live-verified`, `x-last-synced`.
+
+Renaming or removing any of these is a breaking change. Add a note to the consumer repo in the same change.
+
+## Looking up the user docs
+
+The generated `docs/` folder is git-ignored by design. Do not commit it. Consumers that need the user docs generate them locally, then look them up:
+
+- Search the companion, `docs/checkmarx-one-docs-<date>-companion.jsonl`. It has one JSON object per line with `id`, `type`, `summary`, `aliases`, `ui_path`, `cli`, `api_paths` and, for variant pages, `variant_delta`. It is the search-friendly file.
+- Open the page in the main guide, `docs/checkmarx-one-docs-<date>.md`, by its anchor: `#p-<id>`. Every page heading carries that anchor.
+
+```bash
+grep -i '"aliases": \[.*Triage' docs/checkmarx-one-docs-2026-11-02-companion.jsonl
+```
+
+The companion is only present after the enrichment step has run (see [Agent views and the companion](#agent-views-and-the-companion)).
 
 ## Cleanup and safety
 

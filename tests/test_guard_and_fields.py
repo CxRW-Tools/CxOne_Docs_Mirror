@@ -73,6 +73,20 @@ class ShrinkGuard(unittest.TestCase):
         self.assertTrue(spec)
         self.assertNotIn("SHRINK GUARD", report)
 
+    def test_no_baseline_warns_at_the_top_of_the_report(self):
+        code, spec, report, _ = self.stage(None)
+        self.assertEqual(code, 0)
+        self.assertTrue(spec)
+        lines = report.splitlines()
+        self.assertTrue(lines[2].startswith("> **WARNING:** No baseline: removed/changed/deprecation-new"))
+
+    def test_report_counts_five_verbs_not_head(self):
+        code, spec, report, _ = self.stage(self.baseline())
+        n = sum(1 for item in json.loads(read_text(os.path.join(self.root, "g", "cxone_openapi.json")))["paths"].values()
+                for m in item if m in ("get", "post", "put", "patch", "delete"))
+        self.assertIn(f"{n} operations (GET/POST/PUT/PATCH/DELETE;", report)
+        self.assertNotIn("WARNING: No baseline", report)
+
     def test_more_than_five_percent_fewer_operations_fires(self):
         # 5 merged operations against a 6-operation baseline is 16.7% smaller
         code, spec, report, hist = self.stage(self.baseline(extra=["/api/vanished"]))
